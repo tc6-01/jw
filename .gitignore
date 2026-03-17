@@ -1,0 +1,32 @@
+# Build outputs
+bin/
+dist/
+*.out
+
+# Local runtime data
+.jw/
+
+# OS files
+.DS_Store
+
+# Temp
+tmp/
+*.tmp
+
+# Local tool state
+.omc/
+.spec-workflow/
+.claude/
+memory/
+plans/
+research/
+logs/
+state/
+.handoffs/
+
+# Repo-level local runtime
+.jw/
+
+# IDE
+.vscode/
+.idea/
