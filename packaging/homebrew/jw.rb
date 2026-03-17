@@ -1,9 +1,8 @@
 class Jw < Formula
   desc "Terminal web jump tool (zoxide-like for URLs)"
-  homepage "https://github.com/<owner>/jw"
-  url "https://github.com/<owner>/jw/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "<REPLACE_WITH_RELEASE_TARBALL_SHA256>"
+  homepage "https://github.com/tc6-01/jw"
   license "MIT"
+  head "https://github.com/tc6-01/jw.git", branch: "main"
 
   depends_on "go" => :build
 
