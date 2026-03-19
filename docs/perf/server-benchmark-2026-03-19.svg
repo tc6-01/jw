@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>
+text{font-family:Menlo,Consolas,monospace;fill:#1f2937;font-size:14px;}
+.title{font-size:22px;font-weight:700;}
+.subtitle{font-size:13px;fill:#4b5563;}
+</style>
+<text x="40" y="44" class="title">jw Server Benchmark (2026-03-19)</text>
+<text x="40" y="66" class="subtitle">Machine: macOS arm64 | Build: release binary | auto-import-history=off</text>
+<text x="40" y="96" style="font-size:16px;font-weight:700;">P95 Latency (ms)</text>
+<text x="40" y="130">health_seq_10000</text>
+<rect x="220" y="116" width="0.8" height="18" fill="#2563eb"/>
+<text x="228.8" y="130">0.31</text>
+<text x="40" y="168">health_conc_20_x20000</text>
+<rect x="220" y="154" width="22.0" height="18" fill="#2563eb"/>
+<text x="250.0" y="168">8.90</text>
+<text x="40" y="206">record_seq_5000</text>
+<rect x="220" y="192" width="19.6" height="18" fill="#2563eb"/>
+<text x="247.6" y="206">7.90</text>
+<text x="40" y="244">jump_conc_20_x10000</text>
+<rect x="220" y="230" width="460.0" height="18" fill="#2563eb"/>
+<text x="688.0" y="244">185.90</text>
+<text x="40" y="280" style="font-size:16px;font-weight:700;">Throughput (req/s)</text>
+<text x="40" y="340">health_seq_10000</text>
+<rect x="220" y="326" width="432.3" height="18" fill="#16a34a"/>
+<text x="660.3" y="340">3445.7</text>
+<text x="40" y="378">health_conc_20_x20000</text>
+<rect x="220" y="364" width="460.0" height="18" fill="#16a34a"/>
+<text x="688.0" y="378">3666.3</text>
+<text x="40" y="416">record_seq_5000</text>
+<rect x="220" y="402" width="27.8" height="18" fill="#16a34a"/>
+<text x="255.8" y="416">221.5</text>
+<text x="40" y="454">jump_conc_20_x10000</text>
+<rect x="220" y="440" width="15.0" height="18" fill="#16a34a"/>
+<text x="243.0" y="454">119.3</text>
+<text x="40" y="490" style="font-size:16px;font-weight:700;">Peak Memory RSS (MB)</text>
+<text x="40" y="549">idle_30s</text>
+<rect x="220" y="536" width="213.9" height="16" fill="#f59e0b"/>
+<text x="441.9" y="549">10.94</text>
+<text x="40" y="577">health_seq_10000</text>
+<rect x="220" y="564" width="354.0" height="16" fill="#f59e0b"/>
+<text x="582.0" y="577">18.11</text>
+<text x="40" y="605">health_conc_20_x20000</text>
+<rect x="220" y="592" width="387.3" height="16" fill="#f59e0b"/>
+<text x="615.3" y="605">19.81</text>
+<text x="40" y="633">record_seq_5000</text>
+<rect x="220" y="620" width="451.2" height="16" fill="#f59e0b"/>
+<text x="679.2" y="633">23.08</text>
+<text x="40" y="661">jump_conc_20_x10000</text>
+<rect x="220" y="648" width="460.0" height="16" fill="#f59e0b"/>
+<text x="688.0" y="661">23.53</text>
+</svg>

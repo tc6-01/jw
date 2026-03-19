@@ -55,6 +55,43 @@ jw config auto-import-history on
 - `POST /record`
 - `GET /jump?q=<keyword>`
 
+## 是否需要后台服务？
+- 不需要后台也能用：`jw add/query/jump/list/rm` 全部可直接运行。
+- 建议开后台的场景：
+  - 你要让浏览器插件或脚本通过 HTTP 调 `jw`（`/record`、`/jump`）。
+  - 你要开启“自动导入浏览器记录”（需要常驻进程定时执行）。
+- 常用命令：
+  - `jw server start`：后台启动
+  - `jw server status`：查看状态
+  - `jw server stop`：停止后台
+
+## 后台开销（实测数据）
+测试时间：`2026-03-19`  
+测试环境：`macOS arm64`、`go build` 产物、`auto-import-history=off`
+
+核心结论（这台机器实测）：
+- 空闲 30s：`avg_cpu=0.02%`，`peak_rss=10.94MB`
+- 轻量接口（`/health`）高频调用：吞吐可到 `3.4k-3.6k req/s`
+- 写入型接口（`/record`、`/jump`）会明显吃 CPU（涉及本地存储写入与排序）
+- 即便在高压场景，常驻内存峰值约 `23.53MB`
+
+### 批量图（实测）
+![jw server benchmark](docs/perf/server-benchmark-2026-03-19.svg)
+
+### 数据表（实测）
+| Scenario | Requests | Concurrency | Throughput (req/s) | P95 (ms) | Avg CPU (%) | Peak CPU (%) | Peak RSS (MB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| idle_30s | 0 | 1 | 0.00 | 0.000 | 0.02 | 1.80 | 10.94 |
+| health_seq_10000 | 10000 | 1 | 3445.74 | 0.311 | 11.44 | 13.70 | 18.11 |
+| health_conc_20_x20000 | 20000 | 20 | 3666.35 | 8.900 | 16.17 | 17.50 | 19.81 |
+| record_seq_5000 | 5000 | 1 | 221.47 | 7.902 | 90.23 | 99.40 | 23.08 |
+| jump_conc_20_x10000 | 10000 | 20 | 119.33 | 185.897 | 106.34 | 112.20 | 23.53 |
+
+原始数据与复现实验脚本：
+- `docs/perf/server-benchmark-2026-03-19.csv`
+- `docs/perf/server-benchmark-2026-03-19.svg`
+- `scripts/benchmark_server.py`
+
 `POST /record` 请求体示例：
 ```json
 {
