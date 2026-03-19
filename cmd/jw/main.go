@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"jw/internal/app/localstore"
 	"jw/internal/domain/ranker"
@@ -34,6 +35,8 @@ func main() {
 		handleScoreDemo(args)
 	case "tutorial":
 		handleTutorial()
+	case "about":
+		handleAbout()
 	case "server":
 		handleServer(args)
 	case "add":
@@ -53,17 +56,21 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Println("jw - 终端网页快速跳转")
+	fmt.Println("jw - 终端网页快速跳转工具")
 	fmt.Println("")
-	fmt.Println("常用命令:")
-	fmt.Println("  jw server                启动本地记录服务")
-	fmt.Println("  jw add <url> [title]     手动添加一个网址")
-	fmt.Println("  jw query <keyword>       查询候选")
-	fmt.Println("  jw jump <keyword>        跳转最佳结果")
-	fmt.Println("  jw <keyword>             关键词快速跳转（推荐）")
+	fmt.Println("产品介绍: jw about")
+	fmt.Println("快速上手: jw tutorial")
+	fmt.Println("")
+	fmt.Println("命令入口:")
+	fmt.Println("  jw server                启动本地记录服务（自动选空闲端口）")
+	fmt.Println("  jw add <url> [title]     手动添加或更新网址记录")
+	fmt.Println("  jw query <keyword>       查看候选结果")
+	fmt.Println("  jw jump <keyword>        跳转最佳匹配")
+	fmt.Println("  jw <keyword>             关键词快速跳转（等价于 jw jump <keyword>）")
 	fmt.Println("  jw list                  查看本地记录")
 	fmt.Println("  jw rm <url|title>        删除一条记录")
-	fmt.Println("  jw tutorial              运行可执行教程")
+	fmt.Println("  jw tutorial              运行 30 秒可执行教程")
+	fmt.Println("  jw about                 查看产品介绍与上手路径")
 }
 
 func handleNormalize(args []string) {
@@ -120,6 +127,22 @@ func handleTutorial() {
 	fmt.Println("第 4 步：查看与清理")
 	fmt.Println("  jw list")
 	fmt.Println("  jw rm GitHubDocs")
+}
+
+func handleAbout() {
+	fmt.Println("jw - 终端网页快速跳转工具")
+	fmt.Println("zoxide-like for web：把常用网页记在本地，用关键词快速跳转。")
+	fmt.Println("")
+	fmt.Println("30 秒上手:")
+	fmt.Println("  jw tutorial")
+	fmt.Println("  jw add https://github.com GitHub")
+	fmt.Println("  jw github")
+	fmt.Println("")
+	fmt.Println("需要完整命令入口请运行: jw help")
+	fmt.Println("本地数据路径: ~/.jw/store.json")
+	fmt.Println("更多说明: README.md")
+	fmt.Println("Repo: https://github.com/tc6-01/jw")
+	fmt.Println("License: MIT")
 }
 
 func loadDB() (string, *localstore.DB, error) {
@@ -301,6 +324,8 @@ func pickFreeLocalAddr() (string, error) {
 	defer ln.Close()
 	return ln.Addr().String(), nil
 }
+var serverStoreMu sync.Mutex
+
 func newServerMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -322,6 +347,9 @@ func newServerMux() *http.ServeMux {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
+
+		serverStoreMu.Lock()
+		defer serverStoreMu.Unlock()
 
 		path, db, err := loadDB()
 		if err != nil {
@@ -349,7 +377,10 @@ func newServerMux() *http.ServeMux {
 			return
 		}
 
-		_, db, err := loadDB()
+		serverStoreMu.Lock()
+		defer serverStoreMu.Unlock()
+
+		path, db, err := loadDB()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -358,6 +389,10 @@ func newServerMux() *http.ServeMux {
 		if err != nil {
 			http.Error(w, "no match", http.StatusNotFound)
 			return
+		}
+
+		if _, err := db.Add(best.Entry.URL, best.Entry.Title); err == nil {
+			_ = saveDB(path, db)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
