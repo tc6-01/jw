@@ -37,6 +37,8 @@ func main() {
 		handleTutorial()
 	case "about":
 		handleAbout()
+	case "config":
+		handleConfig(args)
 	case "server":
 		handleServer(args)
 	case "add":
@@ -62,7 +64,11 @@ func printHelp() {
 	fmt.Println("快速上手: jw tutorial")
 	fmt.Println("")
 	fmt.Println("命令入口:")
-	fmt.Println("  jw server                启动本地记录服务（自动选空闲端口）")
+	fmt.Println("  jw server [addr]         前台启动本地记录服务（自动选空闲端口）")
+	fmt.Println("  jw server start [addr]   后台启动本地记录服务")
+	fmt.Println("  jw server stop|status    停止/查看后台服务")
+	fmt.Println("  jw config                查看当前配置")
+	fmt.Println("  jw config auto-import-history on|off")
 	fmt.Println("  jw add <url> [title]     手动添加或更新网址记录")
 	fmt.Println("  jw query <keyword>       查看候选结果")
 	fmt.Println("  jw jump <keyword>        跳转最佳匹配")
@@ -294,25 +300,51 @@ func handleRemove(args []string) {
 }
 
 func handleServer(args []string) {
-	addr := ""
-	if len(args) >= 1 {
-		addr = args[0]
+	if len(args) == 0 {
+		runServerForeground("", false)
+		return
 	}
 
-	if addr == "" {
-		autoAddr, err := pickFreeLocalAddr()
-		if err != nil {
-			fmt.Printf("分配空闲端口失败: %v\n", err)
+	switch args[0] {
+	case "start":
+		if len(args) > 2 {
+			fmt.Println("用法: jw server start [addr]")
 			os.Exit(1)
 		}
-		addr = autoAddr
-	}
-
-	fmt.Printf("jw server 已启动: http://%s\n", addr)
-	fmt.Println("可用接口: GET /health, POST /record, GET /jump?q=<keyword>")
-	if err := http.ListenAndServe(addr, newServerMux()); err != nil {
-		fmt.Printf("server 退出: %v\n", err)
-		os.Exit(1)
+		addr := ""
+		if len(args) == 2 {
+			addr = args[1]
+		}
+		startServerInBackground(addr)
+	case "stop":
+		if len(args) != 1 {
+			fmt.Println("用法: jw server stop")
+			os.Exit(1)
+		}
+		stopServerInBackground()
+	case "status":
+		if len(args) != 1 {
+			fmt.Println("用法: jw server status")
+			os.Exit(1)
+		}
+		printServerStatus()
+	case "_run":
+		if len(args) > 2 {
+			fmt.Println("用法: jw server _run [addr]")
+			os.Exit(1)
+		}
+		addr := ""
+		if len(args) == 2 {
+			addr = args[1]
+		}
+		runServerForeground(addr, true)
+	default:
+		if len(args) > 1 {
+			fmt.Println("用法: jw server [addr]")
+			fmt.Println("或:  jw server start [addr]")
+			os.Exit(1)
+		}
+		runServerForeground(args[0], false)
 	}
 }
 
@@ -324,6 +356,7 @@ func pickFreeLocalAddr() (string, error) {
 	defer ln.Close()
 	return ln.Addr().String(), nil
 }
+
 var serverStoreMu sync.Mutex
 
 func newServerMux() *http.ServeMux {

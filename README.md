@@ -18,7 +18,10 @@ jw list
 - `jw tutorial`：可执行教程，按步骤跑完整流程。
 
 ## 命令速查（精简）
-- `jw server`：启动本地记录服务（自动选择空闲端口），提供 `/health`、`/record`、`/jump` 接口。
+- `jw server [addr]`：前台启动本地记录服务（自动选择空闲端口），提供 `/health`、`/record`、`/jump` 接口。
+- `jw server start [addr]` / `jw server stop` / `jw server status`：后台启动、停止、查看服务状态。
+- `jw config`：查看本地配置。
+- `jw config auto-import-history on|off`：开启/关闭自动导入 Chrome 浏览器记录（服务启动后定时导入）。
 - `jw add <url> [title]`：向本地库写入或更新网址记录。
 - `jw query <keyword>`：查看关键词候选与分数。
 - `jw jump <keyword>` / `jw <keyword>`：打开最佳匹配网页，并更新命中计数。
@@ -26,12 +29,26 @@ jw list
 - 需要完整说明时，请运行 `jw help`。
 
 ## 本地记录服务
-启动：
+前台启动：
 ```bash
 jw server
 ```
 
-服务启动后会打印地址，例如：`http://127.0.0.1:18888`。
+后台启动（推荐）：
+```bash
+jw server start
+jw server status
+```
+
+停止后台服务：
+```bash
+jw server stop
+```
+
+开启自动导入浏览器记录：
+```bash
+jw config auto-import-history on
+```
 
 接口：
 - `GET /health`
