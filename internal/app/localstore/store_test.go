@@ -9,26 +9,32 @@ import (
 	"time"
 )
 
-func TestLoadAndSaveRoundTrip(t *testing.T) {
+func hasNodeKey(db *DB, key string) bool {
+	for _, node := range db.Nodes {
+		if node.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLoadAndSaveRoundTripNewModel(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "store.json")
 
 	db, err := Load(storePath)
 	if err != nil {
 		t.Fatalf("load missing store failed: %v", err)
 	}
-	if len(db.Entries) != 0 {
-		t.Fatalf("entries=%d", len(db.Entries))
+	if len(db.Targets) != 0 {
+		t.Fatalf("targets=%d", len(db.Targets))
 	}
 
 	entry, err := db.Add("https://example.com/docs", "Docs")
 	if err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
-	if entry.Count != 1 {
-		t.Fatalf("count=%d", entry.Count)
-	}
 	if entry.Source != SourceManual {
-		t.Fatalf("source=%q want=%q", entry.Source, SourceManual)
+		t.Fatalf("source=%q want manual", entry.Source)
 	}
 	if err := db.Save(storePath); err != nil {
 		t.Fatalf("save failed: %v", err)
@@ -38,21 +44,18 @@ func TestLoadAndSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload failed: %v", err)
 	}
-	if len(reloaded.Entries) != 1 {
-		t.Fatalf("entries=%d", len(reloaded.Entries))
+	if len(reloaded.Targets) != 1 {
+		t.Fatalf("targets=%d", len(reloaded.Targets))
 	}
-	if reloaded.Entries[0].URL != "https://example.com/docs" {
-		t.Fatalf("url=%q", reloaded.Entries[0].URL)
+	if reloaded.Targets[0].URL != "https://example.com/docs" {
+		t.Fatalf("url=%q", reloaded.Targets[0].URL)
 	}
-	if reloaded.Entries[0].Title != "Docs" {
-		t.Fatalf("title=%q", reloaded.Entries[0].Title)
-	}
-	if reloaded.Entries[0].Source != SourceManual {
-		t.Fatalf("source=%q want=%q", reloaded.Entries[0].Source, SourceManual)
+	if reloaded.Metadata.SchemaVersion != schemaVersion {
+		t.Fatalf("schema_version=%d", reloaded.Metadata.SchemaVersion)
 	}
 }
 
-func TestLoadLegacyCompatibilityForMissingSource(t *testing.T) {
+func TestLoadLegacyEntriesMigratesToTargetsAndNodes(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "store.json")
 	legacyPayload := map[string]any{
 		"entries": []map[string]any{{
@@ -71,37 +74,17 @@ func TestLoadLegacyCompatibilityForMissingSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if len(db.Entries) != 1 {
-		t.Fatalf("entries=%d", len(db.Entries))
+	if !db.Metadata.MigratedFromEntries {
+		t.Fatalf("expected migration metadata")
 	}
-	if db.Entries[0].Source != SourceLegacy {
-		t.Fatalf("source=%q want=%q", db.Entries[0].Source, SourceLegacy)
+	if len(db.Targets) != 1 {
+		t.Fatalf("targets=%d", len(db.Targets))
 	}
-}
-
-func TestAddExistingEntryIncrementsCountAndUpdatesTitle(t *testing.T) {
-	db := &DB{}
-
-	first, err := db.Add("https://example.com/path#frag", "Old")
-	if err != nil {
-		t.Fatalf("first add failed: %v", err)
+	if db.Targets[0].Source != SourceLegacy {
+		t.Fatalf("source=%q want legacy", db.Targets[0].Source)
 	}
-	if first.Count != 1 {
-		t.Fatalf("first count=%d", first.Count)
-	}
-
-	second, err := db.Add("https://example.com/path", "  New Title  ")
-	if err != nil {
-		t.Fatalf("second add failed: %v", err)
-	}
-	if second.Count != 2 {
-		t.Fatalf("second count=%d", second.Count)
-	}
-	if second.Title != "New Title" {
-		t.Fatalf("title=%q", second.Title)
-	}
-	if len(db.Entries) != 1 {
-		t.Fatalf("entries=%d", len(db.Entries))
+	if len(db.Nodes) != 2 {
+		t.Fatalf("nodes=%d want root+path", len(db.Nodes))
 	}
 }
 
@@ -132,259 +115,216 @@ func TestAddRejectsDangerousURL(t *testing.T) {
 	}
 }
 
-func TestDeriveCurationMetadataDeterministic(t *testing.T) {
-	meta, err := DeriveCurationMetadata("https://docs.example.com/docs/setup/install?x=1")
-	if err != nil {
-		t.Fatalf("derive metadata failed: %v", err)
-	}
-	if meta.HostKey != "docs.example.com" {
-		t.Fatalf("host=%q", meta.HostKey)
-	}
-	if meta.DepthBucket != DepthBucketMedium {
-		t.Fatalf("bucket=%q", meta.DepthBucket)
-	}
-	if meta.TopicKey != "docs" {
-		t.Fatalf("topic=%q", meta.TopicKey)
-	}
-	if meta.GroupKey == "" {
-		t.Fatalf("group key should not be empty")
-	}
-}
-
-func TestAutoRepresentativeUniquenessInGroup(t *testing.T) {
+func TestCanonicalHostPathTreeNodesFromDeepPath(t *testing.T) {
 	db := &DB{}
-	oldTime := time.Now().Add(-2 * time.Hour).Unix()
-	newTime := time.Now().Unix()
-
-	_, err := db.AddAuto("https://example.com/docs/a", "A", oldTime)
-	if err != nil {
-		t.Fatalf("add auto A failed: %v", err)
-	}
-	latest, err := db.AddAuto("https://example.com/docs/b", "B", newTime)
-	if err != nil {
-		t.Fatalf("add auto B failed: %v", err)
+	if _, err := db.AddManual("https://docs.github.com/actions/workflows", "Actions"); err != nil {
+		t.Fatalf("add failed: %v", err)
 	}
 
-	reps := 0
-	for _, e := range db.Entries {
-		if e.Source == SourceAuto && e.GroupKey == latest.GroupKey && e.Representative {
-			reps++
+	expected := []string{
+		"docs.github.com",
+		"docs.github.com/actions",
+		"docs.github.com/actions/workflows",
+	}
+	for _, key := range expected {
+		if !hasNodeKey(db, key) {
+			t.Fatalf("missing node %q", key)
 		}
 	}
-	if reps != 1 {
-		t.Fatalf("representatives=%d want=1", reps)
-	}
 }
 
-func TestDifferentDepthBucketsRemainIndependent(t *testing.T) {
+func TestAddressResolutionPrefersPathNode(t *testing.T) {
 	db := &DB{}
-	_, err := db.AddAuto("https://example.com/docs", "Docs", time.Now().Add(-time.Minute).Unix())
-	if err != nil {
-		t.Fatalf("add shallow failed: %v", err)
+	if _, err := db.AddManual("https://github.com/docs", "GitHub Docs"); err != nil {
+		t.Fatalf("add github docs failed: %v", err)
 	}
-	_, err = db.AddAuto("https://example.com/docs/a/b", "Docs Deep", time.Now().Unix())
-	if err != nil {
-		t.Fatalf("add deep failed: %v", err)
+	if _, err := db.AddManual("https://example.com/docs", "Example Docs"); err != nil {
+		t.Fatalf("add example docs failed: %v", err)
 	}
 
-	repByBucket := map[string]int{}
-	for _, e := range db.Entries {
-		if e.Source == SourceAuto && e.Representative {
-			repByBucket[e.DepthBucket]++
-		}
-	}
-	if repByBucket[DepthBucketShallow] != 1 {
-		t.Fatalf("shallow reps=%d", repByBucket[DepthBucketShallow])
-	}
-	if repByBucket[DepthBucketMedium] != 1 {
-		t.Fatalf("medium reps=%d", repByBucket[DepthBucketMedium])
-	}
-}
-
-func TestRemoveByURLAndTitle(t *testing.T) {
-	db := &DB{Entries: []Entry{
-		{URL: "https://example.com/a", Title: "A", Source: SourceLegacy},
-		{URL: "https://example.com/b", Title: "B", Source: SourceLegacy},
-	}}
-
-	if !db.Remove("A") {
-		t.Fatalf("remove by title failed")
-	}
-	if len(db.Entries) != 1 {
-		t.Fatalf("entries=%d", len(db.Entries))
-	}
-	if db.Entries[0].URL != "https://example.com/b" {
-		t.Fatalf("remaining url=%q", db.Entries[0].URL)
-	}
-
-	if !db.Remove("https://example.com/b") {
-		t.Fatalf("remove by url failed")
-	}
-	if len(db.Entries) != 0 {
-		t.Fatalf("entries=%d", len(db.Entries))
-	}
-	if db.Remove("   ") {
-		t.Fatalf("blank target should not be removable")
-	}
-}
-
-func TestQueryPrefersManualOverComparableAuto(t *testing.T) {
-	now := time.Now().Unix()
-	db := &DB{Entries: []Entry{
-		{URL: "https://example.com/docs/manual", Title: "Manual", Count: 5, LastSeen: now, Source: SourceManual},
-		{URL: "https://example.com/docs/auto", Title: "Auto", Count: 5, LastSeen: now, Source: SourceAuto, GroupKey: "example.com|d2-3|docs", DepthBucket: DepthBucketMedium, TopicKey: "docs", Representative: true},
-	}}
-
-	matches := db.Query("docs", 5)
-	if len(matches) != 2 {
-		t.Fatalf("matches=%d", len(matches))
-	}
-	if matches[0].Entry.Source != SourceManual {
-		t.Fatalf("top source=%q want manual", matches[0].Entry.Source)
-	}
-}
-
-func TestQueryAllowsAutoToDominateWhenManualWeak(t *testing.T) {
-	now := time.Now().Unix()
-	db := &DB{Entries: []Entry{
-		{URL: "https://example.com/manual-home", Title: "Home", Count: 5, LastSeen: now, Source: SourceManual},
-		{URL: "https://example.com/docs/guide", Title: "Guide", Count: 3, LastSeen: now, Source: SourceAuto, GroupKey: "example.com|d2-3|docs", DepthBucket: DepthBucketMedium, TopicKey: "docs", Representative: true},
-	}}
-
-	matches := db.Query("guide", 5)
-	if len(matches) == 0 {
-		t.Fatalf("expected matches")
-	}
-	if matches[0].Entry.Source != SourceAuto {
-		t.Fatalf("top source=%q want auto", matches[0].Entry.Source)
-	}
-}
-
-func TestQueryDropsNoisyAutoNonRepresentativeEntries(t *testing.T) {
-	now := time.Now().Unix()
-	db := &DB{Entries: []Entry{
-		{
-			URL:            "https://example.com/docs/a",
-			Title:          "A",
-			Count:          4,
-			LastSeen:       now,
-			Source:         SourceAuto,
-			GroupKey:       "example.com|d2-3|docs",
-			DepthBucket:    DepthBucketMedium,
-			TopicKey:       "docs",
-			Representative: true,
-		},
-		{
-			URL:            "https://example.com/docs/b",
-			Title:          "B",
-			Count:          4,
-			LastSeen:       now,
-			Source:         SourceAuto,
-			GroupKey:       "example.com|d2-3|docs",
-			DepthBucket:    DepthBucketMedium,
-			TopicKey:       "docs",
-			Representative: false,
-		},
-	}}
-
-	matches := db.Query("docs", 10)
-	if len(matches) != 1 {
-		t.Fatalf("matches=%d want=1 representative-only", len(matches))
-	}
-	if matches[0].Entry.URL != "https://example.com/docs/a" {
-		t.Fatalf("top url=%q", matches[0].Entry.URL)
-	}
-}
-
-func TestBestPrefersRecentDeepPageWithinTopBand(t *testing.T) {
-	now := time.Now().Unix()
-	db := &DB{Entries: []Entry{
-		{URL: "https://example.com", Title: "Root", Count: 10, LastSeen: now, Source: SourceLegacy},
-		{URL: "https://example.com/docs/a", Title: "A", Count: 10, LastSeen: now - 30, Source: SourceAuto, GroupKey: "example.com|d2-3|docs", DepthBucket: DepthBucketMedium, TopicKey: "docs", Representative: true},
-		{URL: "https://example.com/docs/b", Title: "B", Count: 10, LastSeen: now - 5, Source: SourceAuto, GroupKey: "example.com|d2-3|docs-b", DepthBucket: DepthBucketMedium, TopicKey: "docs", Representative: true},
-	}}
-
-	best, err := db.Best("example")
+	best, err := db.Best("github/docs")
 	if err != nil {
 		t.Fatalf("best failed: %v", err)
 	}
-	if best.Entry.URL != "https://example.com/docs/b" {
-		t.Fatalf("best url=%q want deep recent page", best.Entry.URL)
+	if best.Entry.URL != "https://github.com/docs" {
+		t.Fatalf("best url=%q", best.Entry.URL)
+	}
+	if best.Reason != "address" {
+		t.Fatalf("reason=%q want address", best.Reason)
+	}
+	if best.NodeKey != "github.com/docs" {
+		t.Fatalf("node=%q", best.NodeKey)
 	}
 }
 
-func TestTouchNormalizedIncrementsCount(t *testing.T) {
-	db := &DB{Entries: []Entry{{URL: "https://example.com/a", Count: 1, LastSeen: time.Now().Unix(), Source: SourceLegacy}}}
-	if !db.TouchNormalized("https://example.com/a") {
-		t.Fatalf("touch should succeed")
+func TestManualLearningProvidesDefaultLanding(t *testing.T) {
+	db := &DB{}
+	oldTime := time.Now().Add(-time.Hour).Unix()
+	if _, err := db.AddAuto("https://github.com", "Root", oldTime); err != nil {
+		t.Fatalf("add root failed: %v", err)
 	}
-	if db.Entries[0].Count != 2 {
-		t.Fatalf("count=%d", db.Entries[0].Count)
-	}
-}
-
-func TestQueryAndBestOrderingLegacyFallback(t *testing.T) {
-	now := time.Now().Unix()
-	db := &DB{Entries: []Entry{
-		{URL: "https://github.com", Title: "GitHub", Count: 2, LastSeen: now, Source: SourceLegacy},
-		{URL: "https://docs.github.com", Title: "Docs", Count: 5, LastSeen: now - int64((48 * time.Hour).Seconds()), Source: SourceLegacy},
-		{URL: "https://go.dev", Title: "Go", Count: 9, LastSeen: now, Source: SourceLegacy},
-	}}
-
-	matches := db.Query("github", 5)
-	if len(matches) != 2 {
-		t.Fatalf("matches=%d", len(matches))
-	}
-	if matches[0].Entry.URL != "https://docs.github.com" {
-		t.Fatalf("top url=%q", matches[0].Entry.URL)
-	}
-	if matches[0].Score <= matches[1].Score {
-		t.Fatalf("scores not sorted: %f <= %f", matches[0].Score, matches[1].Score)
+	if _, err := db.AddManual("https://github.com/docs/actions", "Actions"); err != nil {
+		t.Fatalf("add docs failed: %v", err)
 	}
 
 	best, err := db.Best("github")
 	if err != nil {
 		t.Fatalf("best failed: %v", err)
 	}
-	if best.Entry.URL != "https://docs.github.com" {
-		t.Fatalf("best url=%q", best.Entry.URL)
-	}
-
-	_, err = db.Best("not-exist")
-	if !errors.Is(err, ErrNoMatch) {
-		t.Fatalf("expected ErrNoMatch, got %v", err)
+	if best.Entry.URL != "https://github.com/docs/actions" {
+		t.Fatalf("best url=%q want docs actions", best.Entry.URL)
 	}
 }
 
-func TestMixedSourceRoundTripPersistence(t *testing.T) {
-	storePath := filepath.Join(t.TempDir(), "store.json")
-	db := &DB{Entries: []Entry{
-		{URL: "https://example.com/manual", Title: "Manual", Count: 3, LastSeen: time.Now().Unix(), Source: SourceManual},
-		{URL: "https://example.com/docs/a", Title: "Auto", Count: 2, LastSeen: time.Now().Unix(), Source: SourceAuto, GroupKey: "example.com|d2-3|docs", DepthBucket: DepthBucketMedium, TopicKey: "docs", Representative: true},
-		{URL: "https://example.com/legacy", Title: "Legacy", Count: 1, LastSeen: time.Now().Unix(), Source: SourceLegacy},
-	}}
-	if err := db.Save(storePath); err != nil {
-		t.Fatalf("save failed: %v", err)
+func TestDefaultRuleOverridesLearnedLanding(t *testing.T) {
+	db := &DB{
+		Rules: []Rule{{Type: RuleDefault, Pattern: "github.com", Value: "github.com/pulls"}},
+	}
+	if _, err := db.AddAuto("https://github.com/docs", "Docs", time.Now().Unix()); err != nil {
+		t.Fatalf("add docs failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://github.com/pulls", "Pulls", time.Now().Add(-time.Minute).Unix()); err != nil {
+		t.Fatalf("add pulls failed: %v", err)
 	}
 
-	loaded, err := Load(storePath)
+	best, err := db.Best("github")
 	if err != nil {
-		t.Fatalf("load failed: %v", err)
+		t.Fatalf("best failed: %v", err)
 	}
-	if len(loaded.Entries) != 3 {
-		t.Fatalf("entries=%d", len(loaded.Entries))
+	if best.Entry.URL != "https://github.com/pulls" {
+		t.Fatalf("best url=%q want pulls", best.Entry.URL)
 	}
-	byURL := map[string]Entry{}
-	for _, e := range loaded.Entries {
-		byURL[e.URL] = e
+}
+
+func TestAliasRuleExpandsBeforeResolution(t *testing.T) {
+	db := &DB{
+		Rules: []Rule{{Type: RuleAlias, Pattern: "gh", Value: "github.com"}},
 	}
-	if byURL["https://example.com/manual"].Source != SourceManual {
-		t.Fatalf("manual source lost")
+	if _, err := db.AddManual("https://github.com/docs", "Docs"); err != nil {
+		t.Fatalf("add docs failed: %v", err)
 	}
-	if byURL["https://example.com/docs/a"].Source != SourceAuto || !byURL["https://example.com/docs/a"].Representative {
-		t.Fatalf("auto metadata lost")
+
+	best, err := db.Best("gh/docs")
+	if err != nil {
+		t.Fatalf("best failed: %v", err)
 	}
-	if byURL["https://example.com/legacy"].Source != SourceLegacy {
-		t.Fatalf("legacy source lost")
+	if best.Entry.URL != "https://github.com/docs" {
+		t.Fatalf("best url=%q", best.Entry.URL)
+	}
+}
+
+func TestIgnoreRuleSkipsLearning(t *testing.T) {
+	db := &DB{
+		Rules: []Rule{{Type: RuleIgnore, Host: "accounts.example.com", Pattern: "/oauth"}},
+	}
+
+	_, err := db.AddAuto("https://accounts.example.com/oauth/callback?code=abc", "Callback", time.Now().Unix())
+	if !errors.Is(err, ErrIgnoredByRule) {
+		t.Fatalf("err=%v want ErrIgnoredByRule", err)
+	}
+	if len(db.Targets) != 0 {
+		t.Fatalf("targets=%d", len(db.Targets))
+	}
+}
+
+func TestCollapseRuleMapsDynamicTargetsToSameNode(t *testing.T) {
+	db := &DB{
+		Rules: []Rule{{Type: RuleCollapse, Host: "github.com", Pattern: "/pull/*", Value: "/pull/:id"}},
+	}
+	oldTime := time.Now().Add(-time.Hour).Unix()
+	if _, err := db.AddAuto("https://github.com/pull/123", "PR 123", oldTime); err != nil {
+		t.Fatalf("add first pr failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://github.com/pull/456", "PR 456", time.Now().Unix()); err != nil {
+		t.Fatalf("add second pr failed: %v", err)
+	}
+
+	if len(db.Targets) != 2 {
+		t.Fatalf("targets=%d want 2 concrete targets", len(db.Targets))
+	}
+	for _, target := range db.Targets {
+		if target.NodeKey != "github.com/pull/:id" {
+			t.Fatalf("node_key=%q want github.com/pull/:id", target.NodeKey)
+		}
+	}
+
+	best, err := db.Best("github/pull/123")
+	if err != nil {
+		t.Fatalf("best failed: %v", err)
+	}
+	if best.Entry.URL != "https://github.com/pull/456" {
+		t.Fatalf("best url=%q want latest concrete target", best.Entry.URL)
+	}
+}
+
+func TestPreserveQueryRuleKeepsDistinctTargets(t *testing.T) {
+	db := &DB{
+		Rules: []Rule{{Type: RulePreserveQuery, Host: "calendar.example.com", Value: "view"}},
+	}
+	if _, err := db.AddAuto("https://calendar.example.com?view=week", "Week", time.Now().Unix()); err != nil {
+		t.Fatalf("add week failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://calendar.example.com?view=month", "Month", time.Now().Unix()); err != nil {
+		t.Fatalf("add month failed: %v", err)
+	}
+
+	if len(db.Targets) != 2 {
+		t.Fatalf("targets=%d want 2", len(db.Targets))
+	}
+	urls := map[string]struct{}{}
+	for _, target := range db.Targets {
+		urls[target.URL] = struct{}{}
+	}
+	if _, ok := urls["https://calendar.example.com?view=week"]; !ok {
+		t.Fatalf("missing week target")
+	}
+	if _, ok := urls["https://calendar.example.com?view=month"]; !ok {
+		t.Fatalf("missing month target")
+	}
+}
+
+func TestTouchNormalizedPromotesRecentLanding(t *testing.T) {
+	db := &DB{}
+	oldTime := time.Now().Add(-2 * time.Hour).Unix()
+	if _, err := db.AddAuto("https://github.com/root", "Root", oldTime); err != nil {
+		t.Fatalf("add root failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://github.com/docs", "Docs", oldTime); err != nil {
+		t.Fatalf("add docs failed: %v", err)
+	}
+
+	if !db.TouchNormalized("https://github.com/docs") {
+		t.Fatalf("touch should succeed")
+	}
+
+	best, err := db.Best("github")
+	if err != nil {
+		t.Fatalf("best failed: %v", err)
+	}
+	if best.Entry.URL != "https://github.com/docs" {
+		t.Fatalf("best url=%q want docs", best.Entry.URL)
+	}
+}
+
+func TestQueryReportsAddressReasonAndListNodes(t *testing.T) {
+	db := &DB{}
+	if _, err := db.AddManual("https://github.com/docs/actions", "Actions"); err != nil {
+		t.Fatalf("add failed: %v", err)
+	}
+
+	matches := db.Query("github/docs", 5)
+	if len(matches) != 1 {
+		t.Fatalf("matches=%d want 1", len(matches))
+	}
+	if matches[0].Reason != "address" {
+		t.Fatalf("reason=%q", matches[0].Reason)
+	}
+
+	nodes := db.ListNodes()
+	if len(nodes) < 2 {
+		t.Fatalf("nodes=%d want at least root+path", len(nodes))
+	}
+	if nodes[0].Key != "github.com" {
+		t.Fatalf("first node=%q want github.com", nodes[0].Key)
 	}
 }

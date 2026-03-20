@@ -21,6 +21,11 @@ const (
 	autoImportBatch    = 300
 )
 
+var (
+	readChromeHistoryRowsFunc = readChromeHistoryRows
+	saveStoreFunc             = saveStore
+)
+
 type appConfig struct {
 	AutoImportHistory bool  `json:"auto_import_history"`
 	LastChromeVisitUS int64 `json:"last_chrome_visit_us,omitempty"`
@@ -190,7 +195,7 @@ func importChromeHistoryOnce(cfgPath string) (int, error) {
 		return 0, err
 	}
 
-	rows, latestVisit, err := readChromeHistoryRows(cfg.LastChromeVisitUS, autoImportBatch)
+	rows, latestVisit, err := readChromeHistoryRowsFunc(cfg.LastChromeVisitUS, autoImportBatch)
 	if err != nil {
 		return 0, err
 	}
@@ -201,24 +206,30 @@ func importChromeHistoryOnce(cfgPath string) (int, error) {
 	serverStoreMu.Lock()
 	defer serverStoreMu.Unlock()
 
-	path, db, err := loadDB()
+	path, db, err := loadStore()
 	if err != nil {
 		return 0, err
 	}
 
 	imported := 0
+	failed := false
 	for _, row := range rows {
 		visitedAt := chromeVisitTimeToUnix(row.LastVisit)
 		if _, err := db.AddAuto(row.URL, row.Title, visitedAt); err != nil {
+			failed = true
 			continue
 		}
 		imported++
 	}
 
-	if imported > 0 {
-		if err := saveDB(path, db); err != nil {
-			return 0, err
-		}
+	if imported == 0 {
+		return 0, nil
+	}
+	if failed {
+		return imported, nil
+	}
+	if err := saveStoreFunc(path, db); err != nil {
+		return 0, err
 	}
 
 	if latestVisit > cfg.LastChromeVisitUS {

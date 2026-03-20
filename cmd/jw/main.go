@@ -70,7 +70,7 @@ func printHelp() {
 	fmt.Println("  jw config                查看当前配置")
 	fmt.Println("  jw config auto-import-history on|off")
 	fmt.Println("  jw add <url> [title]     手动添加或更新网址记录")
-	fmt.Println("  jw query <keyword>       查看候选结果")
+	fmt.Println("  jw query <keyword>       查看候选结果（支持 host/path）")
 	fmt.Println("  jw jump <keyword>        跳转最佳匹配")
 	fmt.Println("  jw <keyword>             关键词快速跳转（等价于 jw jump <keyword>）")
 	fmt.Println("  jw list                  查看本地记录")
@@ -125,10 +125,11 @@ func handleTutorial() {
 	fmt.Println("")
 	fmt.Println("第 2 步：录入常用网址")
 	fmt.Println("  jw add https://github.com GitHub")
-	fmt.Println("  jw add https://docs.github.com GitHubDocs")
+	fmt.Println("  jw add https://docs.github.com/actions GitHubActions")
 	fmt.Println("")
 	fmt.Println("第 3 步：快速跳转")
 	fmt.Println("  jw github")
+	fmt.Println("  jw github/actions")
 	fmt.Println("")
 	fmt.Println("第 4 步：查看与清理")
 	fmt.Println("  jw list")
@@ -143,6 +144,7 @@ func handleAbout() {
 	fmt.Println("  jw tutorial")
 	fmt.Println("  jw add https://github.com GitHub")
 	fmt.Println("  jw github")
+	fmt.Println("  jw github/actions")
 	fmt.Println("")
 	fmt.Println("需要完整命令入口请运行: jw help")
 	fmt.Println("本地数据路径: ~/.jw/store.json")
@@ -151,7 +153,7 @@ func handleAbout() {
 	fmt.Println("License: MIT")
 }
 
-func loadDB() (string, *localstore.DB, error) {
+func loadStore() (string, localstore.Store, error) {
 	path, err := localstore.DefaultPath()
 	if err != nil {
 		return "", nil, err
@@ -163,8 +165,24 @@ func loadDB() (string, *localstore.DB, error) {
 	return path, db, nil
 }
 
+func saveStore(path string, store localstore.Store) error {
+	return store.Save(path)
+}
+
+func loadDB() (string, *localstore.DB, error) {
+	path, store, err := loadStore()
+	if err != nil {
+		return "", nil, err
+	}
+	db, ok := store.(*localstore.DB)
+	if !ok {
+		return "", nil, fmt.Errorf("unexpected store type %T", store)
+	}
+	return path, db, nil
+}
+
 func saveDB(path string, db *localstore.DB) error {
-	return db.Save(path)
+	return saveStore(path, db)
 }
 
 func handleAdd(args []string) {
@@ -178,7 +196,7 @@ func handleAdd(args []string) {
 		title = strings.Join(args[1:], " ")
 	}
 
-	path, db, err := loadDB()
+	path, db, err := loadStore()
 	if err != nil {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
@@ -188,7 +206,7 @@ func handleAdd(args []string) {
 		fmt.Printf("add 失败: %v\n", err)
 		os.Exit(1)
 	}
-	if err := saveDB(path, db); err != nil {
+	if err := saveStore(path, db); err != nil {
 		fmt.Printf("写入存储失败: %v\n", err)
 		os.Exit(1)
 	}
@@ -202,7 +220,7 @@ func handleQuery(args []string) {
 	}
 
 	keyword := strings.Join(args, " ")
-	_, db, err := loadDB()
+	_, db, err := loadStore()
 	if err != nil {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
@@ -218,7 +236,7 @@ func handleQuery(args []string) {
 		if title == "" {
 			title = "(无标题)"
 		}
-		fmt.Printf("%d) %s\n   %s\n   score=%.4f count=%d\n", i+1, title, m.Entry.URL, m.Score, m.Entry.Count)
+		fmt.Printf("%d) %s\n   %s\n   node=%s via=%s score=%.4f count=%d\n", i+1, title, m.Entry.URL, m.NodeKey, m.Reason, m.Score, m.Entry.Count)
 	}
 }
 
@@ -229,12 +247,12 @@ func handleJump(args []string) {
 	}
 
 	keyword := strings.Join(args, " ")
-	path, db, err := loadDB()
+	path, db, err := loadStore()
 	if err != nil {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
 	}
-	best, err := resolveJumpMatch(path, db, keyword)
+	best, err := resolveJumpMatch(db, keyword)
 	if err != nil {
 		if err == localstore.ErrNoMatch {
 			fmt.Println("没有匹配结果")
@@ -248,25 +266,31 @@ func handleJump(args []string) {
 		fmt.Printf("打开失败: %v\n", err)
 		os.Exit(1)
 	}
+	if err := recordJumpSelection(path, db, best.Entry.URL); err != nil {
+		fmt.Printf("写入存储失败: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("已跳转: %s\n", best.Entry.URL)
 }
 
 func handleList() {
-	_, db, err := loadDB()
+	_, db, err := loadStore()
 	if err != nil {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
 	}
-	if len(db.Entries) == 0 {
+	nodes := db.ListNodes()
+	if len(nodes) == 0 {
 		fmt.Println("暂无记录")
 		return
 	}
-	for i, e := range db.Entries {
-		title := e.Title
+	for i, node := range nodes {
+		title := node.DefaultTitle
 		if title == "" {
 			title = "(无标题)"
 		}
-		fmt.Printf("%d) %s\n   %s\n   count=%d\n", i+1, title, e.URL, e.Count)
+		indent := strings.Repeat("  ", node.Depth)
+		fmt.Printf("%d) %s%s\n   default=%s\n   title=%s count=%d\n", i+1, indent, node.Key, node.DefaultURL, title, node.Count)
 	}
 }
 
@@ -277,7 +301,7 @@ func handleRemove(args []string) {
 	}
 
 	target := strings.Join(args, " ")
-	path, db, err := loadDB()
+	path, db, err := loadStore()
 	if err != nil {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
@@ -286,7 +310,7 @@ func handleRemove(args []string) {
 		fmt.Println("未找到要删除的记录")
 		os.Exit(1)
 	}
-	if err := saveDB(path, db); err != nil {
+	if err := saveStore(path, db); err != nil {
 		fmt.Printf("写入存储失败: %v\n", err)
 		os.Exit(1)
 	}
@@ -378,7 +402,7 @@ func newServerMux() *http.ServeMux {
 		serverStoreMu.Lock()
 		defer serverStoreMu.Unlock()
 
-		path, db, err := loadDB()
+		path, db, err := loadStore()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -388,7 +412,7 @@ func newServerMux() *http.ServeMux {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := saveDB(path, db); err != nil {
+		if err := saveStore(path, db); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -407,12 +431,12 @@ func newServerMux() *http.ServeMux {
 		serverStoreMu.Lock()
 		defer serverStoreMu.Unlock()
 
-		path, db, err := loadDB()
+		_, db, err := loadStore()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		best, err := resolveJumpMatch(path, db, keyword)
+		best, err := resolveJumpMatch(db, keyword)
 		if err != nil {
 			http.Error(w, "no match", http.StatusNotFound)
 			return
@@ -424,15 +448,15 @@ func newServerMux() *http.ServeMux {
 	return mux
 }
 
-func resolveJumpMatch(path string, db *localstore.DB, keyword string) (localstore.Match, error) {
-	best, err := db.Best(keyword)
-	if err != nil {
-		return localstore.Match{}, err
+func resolveJumpMatch(store localstore.Store, keyword string) (localstore.Match, error) {
+	return store.Best(keyword)
+}
+
+func recordJumpSelection(path string, store localstore.Store, normalizedURL string) error {
+	if !store.TouchNormalized(normalizedURL) {
+		return nil
 	}
-	if db.TouchNormalized(best.Entry.URL) {
-		_ = saveDB(path, db)
-	}
-	return best, nil
+	return saveStore(path, store)
 }
 
 func openURL(rawURL string) error {

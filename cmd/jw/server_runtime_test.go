@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"jw/internal/app/localstore"
 )
 
 func TestParseOnOff(t *testing.T) {
@@ -105,5 +108,165 @@ func TestChromeVisitTimeToUnix(t *testing.T) {
 	now := time.Now().Unix()
 	if zero < now-5 || zero > now+5 {
 		t.Fatalf("zero visit fallback out of range: %d now=%d", zero, now)
+	}
+}
+
+func TestImportChromeHistoryOnceDoesNotAdvanceCheckpointWhenSaveStoreFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfgPath, err := appConfigPath()
+	if err != nil {
+		t.Fatalf("appConfigPath failed: %v", err)
+	}
+	cfg := appConfig{AutoImportHistory: true, LastChromeVisitUS: 100}
+	if err := saveAppConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("saveAppConfig failed: %v", err)
+	}
+
+	originalRead := readChromeHistoryRowsFunc
+	originalSaveStore := saveStoreFunc
+	defer func() {
+		readChromeHistoryRowsFunc = originalRead
+		saveStoreFunc = originalSaveStore
+	}()
+
+	readChromeHistoryRowsFunc = func(sinceVisitUS int64, limit int) ([]historyRow, int64, error) {
+		if sinceVisitUS != 100 {
+			t.Fatalf("sinceVisitUS=%d want 100", sinceVisitUS)
+		}
+		if limit != autoImportBatch {
+			t.Fatalf("limit=%d want %d", limit, autoImportBatch)
+		}
+		return []historyRow{{URL: "https://example.com/docs", Title: "Docs", LastVisit: 200}}, 200, nil
+	}
+	wantErr := errors.New("save failed")
+	saveStoreFunc = func(path string, store localstore.Store) error {
+		return wantErr
+	}
+
+	imported, err := importChromeHistoryOnce(cfgPath)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err=%v want=%v", err, wantErr)
+	}
+	if imported != 0 {
+		t.Fatalf("imported=%d want 0", imported)
+	}
+
+	out, _, err := loadAppConfig()
+	if err != nil {
+		t.Fatalf("loadAppConfig failed: %v", err)
+	}
+	if out.LastChromeVisitUS != 100 {
+		t.Fatalf("LastChromeVisitUS=%d want 100", out.LastChromeVisitUS)
+	}
+}
+
+func TestImportChromeHistoryOnceDoesNotAdvanceCheckpointOnPartialFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfgPath, err := appConfigPath()
+	if err != nil {
+		t.Fatalf("appConfigPath failed: %v", err)
+	}
+	cfg := appConfig{AutoImportHistory: true, LastChromeVisitUS: 100}
+	if err := saveAppConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("saveAppConfig failed: %v", err)
+	}
+
+	path, db, err := loadDB()
+	if err != nil {
+		t.Fatalf("loadDB failed: %v", err)
+	}
+	if _, err := db.AddManual("https://example.com/ok", "Manual"); err != nil {
+		t.Fatalf("AddManual failed: %v", err)
+	}
+	if err := saveDB(path, db); err != nil {
+		t.Fatalf("saveDB failed: %v", err)
+	}
+
+	originalRead := readChromeHistoryRowsFunc
+	originalSaveStore := saveStoreFunc
+	defer func() {
+		readChromeHistoryRowsFunc = originalRead
+		saveStoreFunc = originalSaveStore
+	}()
+
+	readChromeHistoryRowsFunc = func(sinceVisitUS int64, limit int) ([]historyRow, int64, error) {
+		return []historyRow{
+			{URL: "https://example.com/ok", Title: "OK", LastVisit: 200},
+			{URL: "javascript:alert(1)", Title: "Bad", LastVisit: 300},
+		}, 300, nil
+	}
+
+	saveCalled := false
+	saveStoreFunc = func(path string, store localstore.Store) error {
+		saveCalled = true
+		return nil
+	}
+
+	imported, err := importChromeHistoryOnce(cfgPath)
+	if err != nil {
+		t.Fatalf("importChromeHistoryOnce failed: %v", err)
+	}
+	if imported != 1 {
+		t.Fatalf("imported=%d want 1", imported)
+	}
+	if saveCalled {
+		t.Fatalf("saveStore should not be called on partial failure")
+	}
+
+	out, _, err := loadAppConfig()
+	if err != nil {
+		t.Fatalf("loadAppConfig failed: %v", err)
+	}
+	if out.LastChromeVisitUS != 100 {
+		t.Fatalf("LastChromeVisitUS=%d want 100", out.LastChromeVisitUS)
+	}
+}
+
+func TestImportChromeHistoryOnceAdvancesCheckpointAfterSuccessfulSave(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfgPath, err := appConfigPath()
+	if err != nil {
+		t.Fatalf("appConfigPath failed: %v", err)
+	}
+	cfg := appConfig{AutoImportHistory: true, LastChromeVisitUS: 100}
+	if err := saveAppConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("saveAppConfig failed: %v", err)
+	}
+
+	originalRead := readChromeHistoryRowsFunc
+	originalSaveStore := saveStoreFunc
+	defer func() {
+		readChromeHistoryRowsFunc = originalRead
+		saveStoreFunc = originalSaveStore
+	}()
+
+	readChromeHistoryRowsFunc = func(sinceVisitUS int64, limit int) ([]historyRow, int64, error) {
+		return []historyRow{{URL: "https://example.com/docs", Title: "Docs", LastVisit: 250}}, 250, nil
+	}
+
+	saveStoreFunc = func(path string, store localstore.Store) error {
+		return store.Save(path)
+	}
+
+	imported, err := importChromeHistoryOnce(cfgPath)
+	if err != nil {
+		t.Fatalf("importChromeHistoryOnce failed: %v", err)
+	}
+	if imported != 1 {
+		t.Fatalf("imported=%d want 1", imported)
+	}
+
+	out, _, err := loadAppConfig()
+	if err != nil {
+		t.Fatalf("loadAppConfig failed: %v", err)
+	}
+	if out.LastChromeVisitUS != 250 {
+		t.Fatalf("LastChromeVisitUS=%d want 250", out.LastChromeVisitUS)
 	}
 }

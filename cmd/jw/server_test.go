@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -39,15 +40,15 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
-func TestRecordAndJumpHandlers(t *testing.T) {
+func TestRecordAndJumpHandlersUseTreeStore(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
 	h := newServerMux()
 
 	payload := map[string]string{
-		"url":   "https://golang.org",
-		"title": "Go",
+		"url":   "https://golang.org/doc",
+		"title": "Go Docs",
 	}
 	b, _ := json.Marshal(payload)
 
@@ -67,7 +68,7 @@ func TestRecordAndJumpHandlers(t *testing.T) {
 	if !recordBody.OK {
 		t.Fatalf("record ok=false")
 	}
-	if recordBody.URL != "https://golang.org" {
+	if recordBody.URL != "https://golang.org/doc" {
 		t.Fatalf("record url=%q", recordBody.URL)
 	}
 
@@ -76,14 +77,11 @@ func TestRecordAndJumpHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load store failed: %v", err)
 	}
-	if len(db.Entries) != 1 {
-		t.Fatalf("entries=%d", len(db.Entries))
+	if len(db.Targets) != 1 {
+		t.Fatalf("targets=%d", len(db.Targets))
 	}
-	if db.Entries[0].URL != "https://golang.org" {
-		t.Fatalf("stored url=%q", db.Entries[0].URL)
-	}
-	beforeJumpCount := db.Entries[0].Count
-	beforeJumpLastSeen := db.Entries[0].LastSeen
+	beforeJumpCount := db.Targets[0].Count
+	beforeJumpLastSeen := db.Targets[0].LastSeen
 
 	jumpReq := httptest.NewRequest(http.MethodGet, "/jump?q=go", nil)
 	jumpW := httptest.NewRecorder()
@@ -101,7 +99,7 @@ func TestRecordAndJumpHandlers(t *testing.T) {
 	if !jumpBody.OK {
 		t.Fatalf("jump ok=false")
 	}
-	if jumpBody.URL != "https://golang.org" {
+	if jumpBody.URL != "https://golang.org/doc" {
 		t.Fatalf("jump url=%q", jumpBody.URL)
 	}
 	if jumpBody.Score <= 0 {
@@ -112,14 +110,70 @@ func TestRecordAndJumpHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load store after jump failed: %v", err)
 	}
-	if len(dbAfterJump.Entries) != 1 {
-		t.Fatalf("entries after jump=%d", len(dbAfterJump.Entries))
+	if len(dbAfterJump.Targets) != 1 {
+		t.Fatalf("targets after jump=%d", len(dbAfterJump.Targets))
 	}
-	if dbAfterJump.Entries[0].Count != beforeJumpCount+1 {
-		t.Fatalf("count after jump=%d want=%d", dbAfterJump.Entries[0].Count, beforeJumpCount+1)
+	if dbAfterJump.Targets[0].Count != beforeJumpCount {
+		t.Fatalf("count after jump=%d want=%d", dbAfterJump.Targets[0].Count, beforeJumpCount)
 	}
-	if dbAfterJump.Entries[0].LastSeen < beforeJumpLastSeen {
-		t.Fatalf("last_seen after jump=%d before=%d", dbAfterJump.Entries[0].LastSeen, beforeJumpLastSeen)
+	if dbAfterJump.Targets[0].LastSeen != beforeJumpLastSeen {
+		t.Fatalf("last_seen after jump=%d want=%d", dbAfterJump.Targets[0].LastSeen, beforeJumpLastSeen)
+	}
+}
+
+func TestRecordJumpSelectionPersistsLearningForCLIFlow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path, db, err := loadDB()
+	if err != nil {
+		t.Fatalf("loadDB failed: %v", err)
+	}
+	oldTime := int64(1_700_000_000)
+	if _, err := db.AddAuto("https://github.com/root", "Root", oldTime+60); err != nil {
+		t.Fatalf("add root failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://github.com/docs", "Docs", oldTime); err != nil {
+		t.Fatalf("add docs failed: %v", err)
+	}
+	if err := saveDB(path, db); err != nil {
+		t.Fatalf("saveDB failed: %v", err)
+	}
+
+	best, err := resolveJumpMatch(db, "github")
+	if err != nil {
+		t.Fatalf("resolveJumpMatch failed: %v", err)
+	}
+	if best.Entry.URL != "https://github.com/root" {
+		t.Fatalf("unexpected initial url=%q", best.Entry.URL)
+	}
+
+	if err := recordJumpSelection(path, db, "https://github.com/docs"); err != nil {
+		t.Fatalf("recordJumpSelection failed: %v", err)
+	}
+
+	reloaded, err := localstore.Load(path)
+	if err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	updatedBest, err := resolveJumpMatch(reloaded, "github")
+	if err != nil {
+		t.Fatalf("resolveJumpMatch after record failed: %v", err)
+	}
+	if updatedBest.Entry.URL != "https://github.com/docs" {
+		t.Fatalf("updated url=%q want docs", updatedBest.Entry.URL)
+	}
+}
+
+func TestRecordJumpSelectionIsNoopForUnknownURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.json")
+	db := &localstore.DB{}
+
+	if err := recordJumpSelection(path, db, "https://example.com/missing"); err != nil {
+		t.Fatalf("recordJumpSelection failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no store file, err=%v", err)
 	}
 }
 
@@ -177,44 +231,22 @@ func TestJumpHTTPAndCLIResolverSharePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadDB failed: %v", err)
 	}
-	now := int64(1_700_000_000)
-	db.Entries = []localstore.Entry{
-		{
-			URL:      "https://example.com",
-			Title:    "Root",
-			Count:    10,
-			LastSeen: now,
-			Source:   localstore.SourceLegacy,
-		},
-		{
-			URL:            "https://example.com/docs/a",
-			Title:          "Docs A",
-			Count:          10,
-			LastSeen:       now - 30,
-			Source:         localstore.SourceAuto,
-			GroupKey:       "example.com|d2-3|docs",
-			DepthBucket:    localstore.DepthBucketMedium,
-			TopicKey:       "docs",
-			Representative: true,
-		},
-		{
-			URL:            "https://example.com/blog/b",
-			Title:          "Blog B",
-			Count:          10,
-			LastSeen:       now - 5,
-			Source:         localstore.SourceAuto,
-			GroupKey:       "example.com|d2-3|blog",
-			DepthBucket:    localstore.DepthBucketMedium,
-			TopicKey:       "blog",
-			Representative: true,
-		},
+	db.Rules = []localstore.Rule{
+		{Type: localstore.RuleAlias, Pattern: "gh", Value: "github.com"},
+		{Type: localstore.RuleDefault, Pattern: "github.com", Value: "github.com/pulls"},
+	}
+	if _, err := db.AddAuto("https://github.com/docs", "Docs", 1_700_000_000); err != nil {
+		t.Fatalf("add docs failed: %v", err)
+	}
+	if _, err := db.AddAuto("https://github.com/pulls", "Pulls", 1_700_000_100); err != nil {
+		t.Fatalf("add pulls failed: %v", err)
 	}
 	if err := saveDB(path, db); err != nil {
 		t.Fatalf("saveDB failed: %v", err)
 	}
 
 	h := newServerMux()
-	jumpReq := httptest.NewRequest(http.MethodGet, "/jump?q=example", nil)
+	jumpReq := httptest.NewRequest(http.MethodGet, "/jump?q=gh", nil)
 	jumpW := httptest.NewRecorder()
 	h.ServeHTTP(jumpW, jumpReq)
 	if jumpW.Code != http.StatusOK {
@@ -225,11 +257,11 @@ func TestJumpHTTPAndCLIResolverSharePolicy(t *testing.T) {
 	}
 	jumpBody := decodeJSONBody[jumpResp](t, jumpW.Body)
 
-	path2, db2, err := loadDB()
+	_, db2, err := loadDB()
 	if err != nil {
 		t.Fatalf("reload db failed: %v", err)
 	}
-	best, err := resolveJumpMatch(path2, db2, "example")
+	best, err := resolveJumpMatch(db2, "gh")
 	if err != nil {
 		t.Fatalf("resolveJumpMatch failed: %v", err)
 	}
@@ -237,7 +269,7 @@ func TestJumpHTTPAndCLIResolverSharePolicy(t *testing.T) {
 	if jumpBody.URL != best.Entry.URL {
 		t.Fatalf("http jump url=%q resolver url=%q", jumpBody.URL, best.Entry.URL)
 	}
-	if jumpBody.URL != "https://example.com/blog/b" {
+	if jumpBody.URL != "https://github.com/pulls" {
 		t.Fatalf("unexpected jump target=%q", jumpBody.URL)
 	}
 }

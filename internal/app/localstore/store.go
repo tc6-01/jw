@@ -15,16 +15,23 @@ import (
 	"jw/internal/domain/urlnorm"
 )
 
-var ErrNoMatch = errors.New("no matched destination")
+var (
+	ErrNoMatch       = errors.New("no matched destination")
+	ErrIgnoredByRule = errors.New("url ignored by rule")
+)
 
 const (
 	SourceManual = "manual"
 	SourceAuto   = "auto"
 	SourceLegacy = "legacy"
 
-	DepthBucketShallow = "d0-1"
-	DepthBucketMedium  = "d2-3"
-	DepthBucketDeep    = "d4+"
+	RuleAlias         = "alias"
+	RuleIgnore        = "ignore"
+	RuleCollapse      = "collapse"
+	RuleDefault       = "default"
+	RulePreserveQuery = "preserve_query"
+
+	schemaVersion = 2
 )
 
 type Entry struct {
@@ -40,19 +47,95 @@ type Entry struct {
 }
 
 type Match struct {
-	Entry Entry
-	Score float64
+	Entry   Entry
+	Score   float64
+	Reason  string
+	NodeKey string
+}
+
+type Target struct {
+	Key      string `json:"key"`
+	URL      string `json:"url"`
+	Title    string `json:"title,omitempty"`
+	Count    int    `json:"count"`
+	LastSeen int64  `json:"last_seen"`
+	Source   string `json:"source,omitempty"`
+	HostKey  string `json:"host_key,omitempty"`
+	NodePath string `json:"node_path,omitempty"`
+	NodeKey  string `json:"node_key,omitempty"`
+}
+
+type Node struct {
+	Key              string `json:"key"`
+	HostKey          string `json:"host_key"`
+	Path             string `json:"path,omitempty"`
+	ParentKey        string `json:"parent_key,omitempty"`
+	Count            int    `json:"count"`
+	LastSeen         int64  `json:"last_seen"`
+	DefaultTargetKey string `json:"default_target_key,omitempty"`
+	ManualTargetKey  string `json:"manual_target_key,omitempty"`
+	ExactTargetKey   string `json:"exact_target_key,omitempty"`
+}
+
+type Rule struct {
+	Type    string `json:"type"`
+	Pattern string `json:"pattern,omitempty"`
+	Value   string `json:"value,omitempty"`
+	Host    string `json:"host,omitempty"`
+}
+
+type Metadata struct {
+	SchemaVersion       int   `json:"schema_version,omitempty"`
+	MigratedFromEntries bool  `json:"migrated_from_entries,omitempty"`
+	LegacyEntryCount    int   `json:"legacy_entry_count,omitempty"`
+	LastMigratedAt      int64 `json:"last_migrated_at,omitempty"`
+}
+
+type NodeSummary struct {
+	Key          string
+	HostKey      string
+	Path         string
+	Depth        int
+	Count        int
+	LastSeen     int64
+	DefaultURL   string
+	DefaultTitle string
+}
+
+type Store interface {
+	Save(path string) error
+	Add(rawURL, title string) (Entry, error)
+	AddManual(rawURL, title string) (Entry, error)
+	AddAuto(rawURL, title string, eventUnix int64) (Entry, error)
+	Touch(rawURL string) bool
+	TouchNormalized(normalizedURL string) bool
+	Remove(target string) bool
+	Query(keyword string, limit int) []Match
+	Best(keyword string) (Match, error)
+	ListNodes() []NodeSummary
 }
 
 type DB struct {
-	Entries []Entry `json:"entries"`
+	Entries  []Entry  `json:"entries,omitempty"`
+	Targets  []Target `json:"targets,omitempty"`
+	Nodes    []Node   `json:"nodes,omitempty"`
+	Rules    []Rule   `json:"rules,omitempty"`
+	Metadata Metadata `json:"metadata,omitempty"`
 }
 
-type CurationMetadata struct {
-	HostKey     string
-	DepthBucket string
-	TopicKey    string
-	GroupKey    string
+type canonicalTarget struct {
+	TargetURL string
+	HostKey   string
+	NodePath  string
+	NodeKey   string
+	NodeChain []nodeRef
+}
+
+type nodeRef struct {
+	Key       string
+	HostKey   string
+	Path      string
+	ParentKey string
 }
 
 func DefaultPath() (string, error) {
@@ -67,21 +150,22 @@ func Load(path string) (*DB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &DB{Entries: []Entry{}}, nil
+			db := &DB{}
+			db.ensureCompatibility()
+			return db, nil
 		}
 		return nil, err
 	}
 
 	if len(data) == 0 {
-		return &DB{Entries: []Entry{}}, nil
+		db := &DB{}
+		db.ensureCompatibility()
+		return db, nil
 	}
 
 	var db DB
 	if err := json.Unmarshal(data, &db); err != nil {
 		return nil, err
-	}
-	if db.Entries == nil {
-		db.Entries = []Entry{}
 	}
 	db.ensureCompatibility()
 	return &db, nil
@@ -91,6 +175,8 @@ func (db *DB) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+
+	db.ensureCompatibility()
 
 	data, err := json.MarshalIndent(db, "", "  ")
 	if err != nil {
@@ -117,114 +203,79 @@ func (db *DB) AddAuto(rawURL, title string, eventUnix int64) (Entry, error) {
 }
 
 func (db *DB) addWithSource(rawURL, title, source string, eventUnix int64) (Entry, error) {
-	normalized, err := urlnorm.NormalizeAndRedact(rawURL)
+	canonical, err := db.deriveCanonicalTarget(rawURL)
 	if err != nil {
 		return Entry{}, err
 	}
-
-	title = strings.TrimSpace(title)
 	if eventUnix <= 0 {
 		eventUnix = time.Now().Unix()
 	}
-	oldGroupKey := ""
 
-	for i := range db.Entries {
-		if db.Entries[i].URL != normalized {
-			continue
-		}
+	source = normalizeSource(source)
+	title = strings.TrimSpace(title)
 
-		entry := &db.Entries[i]
-		currentSource := normalizeSource(entry.Source)
-		if source == SourceAuto && currentSource == SourceManual {
-			entry.Count++
-			if eventUnix > entry.LastSeen {
-				entry.LastSeen = eventUnix
-			}
-			if title != "" {
-				entry.Title = title
-			}
-			return *entry, nil
-		}
-
-		oldGroupKey = entry.GroupKey
-		entry.Count++
-		if eventUnix > entry.LastSeen {
-			entry.LastSeen = eventUnix
+	existing := db.findTargetByURL(canonical.TargetURL)
+	if existing != nil {
+		existing.Count++
+		if eventUnix > existing.LastSeen {
+			existing.LastSeen = eventUnix
 		}
 		if title != "" {
-			entry.Title = title
+			existing.Title = title
 		}
-
-		switch source {
-		case SourceManual:
-			entry.Source = SourceManual
-			clearAutoMetadata(entry)
-		case SourceAuto:
-			entry.Source = SourceAuto
-			meta, err := DeriveCurationMetadata(normalized)
-			if err != nil {
-				return Entry{}, err
-			}
-			entry.GroupKey = meta.GroupKey
-			entry.DepthBucket = meta.DepthBucket
-			entry.TopicKey = meta.TopicKey
+		if source == SourceManual {
+			existing.Source = SourceManual
+		} else if existing.Source != SourceManual {
+			existing.Source = source
 		}
-
-		if oldGroupKey != "" && oldGroupKey != entry.GroupKey {
-			db.reconcileAutoGroup(oldGroupKey)
-		}
-		if normalizeSource(entry.Source) == SourceAuto {
-			db.reconcileAutoGroup(entry.GroupKey)
-		}
-		return *entry, nil
+		existing.HostKey = canonical.HostKey
+		existing.NodePath = canonical.NodePath
+		existing.NodeKey = canonical.NodeKey
+		db.rebuildDerivedState()
+		return targetToEntry(*existing), nil
 	}
 
-	entry := Entry{
-		URL:      normalized,
+	target := Target{
+		Key:      canonical.TargetURL,
+		URL:      canonical.TargetURL,
 		Title:    title,
 		Count:    1,
 		LastSeen: eventUnix,
-		Source:   normalizeSource(source),
+		Source:   source,
+		HostKey:  canonical.HostKey,
+		NodePath: canonical.NodePath,
+		NodeKey:  canonical.NodeKey,
 	}
-	if entry.Source == SourceAuto {
-		meta, err := DeriveCurationMetadata(normalized)
-		if err != nil {
-			return Entry{}, err
-		}
-		entry.GroupKey = meta.GroupKey
-		entry.DepthBucket = meta.DepthBucket
-		entry.TopicKey = meta.TopicKey
-	}
-
-	db.Entries = append(db.Entries, entry)
-	if entry.Source == SourceAuto {
-		db.reconcileAutoGroup(entry.GroupKey)
-	}
-	return entry, nil
+	db.Targets = append(db.Targets, target)
+	db.rebuildDerivedState()
+	return targetToEntry(target), nil
 }
 
 func (db *DB) Touch(rawURL string) bool {
-	normalized, err := urlnorm.NormalizeAndRedact(rawURL)
+	canonical, err := db.deriveCanonicalTarget(rawURL)
 	if err != nil {
 		return false
 	}
-	return db.TouchNormalized(normalized)
+	return db.touchTargetURL(canonical.TargetURL)
 }
 
 func (db *DB) TouchNormalized(normalizedURL string) bool {
-	now := time.Now().Unix()
-	for i := range db.Entries {
-		if db.Entries[i].URL != normalizedURL {
-			continue
-		}
-		db.Entries[i].Count++
-		db.Entries[i].LastSeen = now
-		if normalizeSource(db.Entries[i].Source) == SourceAuto {
-			db.reconcileAutoGroup(db.Entries[i].GroupKey)
-		}
-		return true
+	canonical, err := db.deriveCanonicalTargetFromNormalized(normalizedURL)
+	if err != nil {
+		return false
 	}
-	return false
+	return db.touchTargetURL(canonical.TargetURL)
+}
+
+func (db *DB) touchTargetURL(targetURL string) bool {
+	target := db.findTargetByURL(targetURL)
+	if target == nil {
+		return false
+	}
+	target.Count++
+	target.LastSeen = time.Now().Unix()
+	db.rebuildDerivedState()
+	return true
 }
 
 func (db *DB) Remove(target string) bool {
@@ -233,13 +284,10 @@ func (db *DB) Remove(target string) bool {
 		return false
 	}
 
-	for i := range db.Entries {
-		if db.Entries[i].URL == target || db.Entries[i].Title == target {
-			removed := db.Entries[i]
-			db.Entries = append(db.Entries[:i], db.Entries[i+1:]...)
-			if normalizeSource(removed.Source) == SourceAuto {
-				db.reconcileAutoGroup(removed.GroupKey)
-			}
+	for i := range db.Targets {
+		if db.Targets[i].URL == target || db.Targets[i].Title == target {
+			db.Targets = append(db.Targets[:i], db.Targets[i+1:]...)
+			db.rebuildDerivedState()
 			return true
 		}
 	}
@@ -247,29 +295,48 @@ func (db *DB) Remove(target string) bool {
 }
 
 func (db *DB) Query(keyword string, limit int) []Match {
-	keyword = strings.ToLower(strings.TrimSpace(keyword))
+	keyword = strings.TrimSpace(keyword)
 	if limit <= 0 {
 		limit = 5
 	}
 
+	if keyword == "" {
+		return nil
+	}
+
+	if direct, ok := db.resolveAddressMatch(keyword); ok {
+		return []Match{direct}
+	}
+
 	now := time.Now()
-	matches := make([]Match, 0, len(db.Entries))
-	for _, e := range db.Entries {
-		e.Source = normalizeSource(e.Source)
-		if e.Source == SourceAuto && !e.Representative {
+	lowerKeyword := strings.ToLower(keyword)
+	matches := make([]Match, 0, len(db.Nodes))
+	seenTargets := map[string]struct{}{}
+	for _, node := range db.Nodes {
+		target := db.resolveLandingTarget(node.Key, map[string]bool{})
+		if target == nil {
 			continue
 		}
-		score := score(keyword, e, now)
-		if score <= 0 {
+		reason, kwScore := fuzzyMatchReason(lowerKeyword, node, *target)
+		if kwScore <= 0 {
 			continue
 		}
-		matches = append(matches, Match{Entry: e, Score: score})
+		if _, exists := seenTargets[target.URL]; exists {
+			continue
+		}
+		seenTargets[target.URL] = struct{}{}
+		matches = append(matches, Match{
+			Entry:   targetToEntry(*target),
+			Score:   scoreNode(kwScore, node, *target, now),
+			Reason:  reason,
+			NodeKey: node.Key,
+		})
 	}
 
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Score == matches[j].Score {
 			if matches[i].Entry.LastSeen == matches[j].Entry.LastSeen {
-				return entryDepth(matches[i].Entry.URL) > entryDepth(matches[j].Entry.URL)
+				return pathDepth(matches[i].NodeKey) > pathDepth(matches[j].NodeKey)
 			}
 			return matches[i].Entry.LastSeen > matches[j].Entry.LastSeen
 		}
@@ -287,89 +354,664 @@ func (db *DB) Best(keyword string) (Match, error) {
 	if len(matches) == 0 {
 		return Match{}, ErrNoMatch
 	}
-
-	baseline := matches[0].Score * 0.90
-	if baseline < 0 {
-		baseline = matches[0].Score
-	}
-
-	var deepCandidates []Match
-	for _, m := range matches {
-		if m.Score < baseline {
-			break
-		}
-		if isDeepPage(m.Entry.URL) {
-			deepCandidates = append(deepCandidates, m)
-		}
-	}
-
-	if len(deepCandidates) == 0 {
-		return matches[0], nil
-	}
-
-	best := deepCandidates[0]
-	for i := 1; i < len(deepCandidates); i++ {
-		if deepCandidates[i].Entry.LastSeen > best.Entry.LastSeen {
-			best = deepCandidates[i]
-		}
-	}
-	return best, nil
+	return matches[0], nil
 }
 
-func DeriveCurationMetadata(normalizedURL string) (CurationMetadata, error) {
-	u, err := url.Parse(normalizedURL)
-	if err != nil {
-		return CurationMetadata{}, err
+func (db *DB) ListNodes() []NodeSummary {
+	summaries := make([]NodeSummary, 0, len(db.Nodes))
+	for _, node := range db.Nodes {
+		target := db.resolveLandingTarget(node.Key, map[string]bool{})
+		if target == nil {
+			continue
+		}
+		summaries = append(summaries, NodeSummary{
+			Key:          node.Key,
+			HostKey:      node.HostKey,
+			Path:         node.Path,
+			Depth:        pathDepth(node.Key),
+			Count:        node.Count,
+			LastSeen:     node.LastSeen,
+			DefaultURL:   target.URL,
+			DefaultTitle: target.Title,
+		})
 	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].HostKey == summaries[j].HostKey {
+			if summaries[i].Depth == summaries[j].Depth {
+				return summaries[i].Path < summaries[j].Path
+			}
+			return summaries[i].Depth < summaries[j].Depth
+		}
+		return summaries[i].HostKey < summaries[j].HostKey
+	})
+	return summaries
+}
+
+func (db *DB) ensureCompatibility() {
+	if db.Entries == nil {
+		db.Entries = []Entry{}
+	}
+	if db.Targets == nil {
+		db.Targets = []Target{}
+	}
+	if db.Nodes == nil {
+		db.Nodes = []Node{}
+	}
+	if db.Rules == nil {
+		db.Rules = []Rule{}
+	}
+
+	for i := range db.Rules {
+		db.Rules[i] = normalizeRule(db.Rules[i])
+	}
+
+	if len(db.Targets) == 0 && len(db.Entries) > 0 {
+		db.migrateLegacyEntries()
+	}
+
+	db.rebuildDerivedState()
+}
+
+func (db *DB) migrateLegacyEntries() {
+	now := time.Now().Unix()
+	db.Metadata.MigratedFromEntries = true
+	db.Metadata.LegacyEntryCount = len(db.Entries)
+	db.Metadata.LastMigratedAt = now
+
+	targets := make([]Target, 0, len(db.Entries))
+	for _, entry := range db.Entries {
+		if strings.TrimSpace(entry.URL) == "" {
+			continue
+		}
+
+		canonical, err := db.deriveCanonicalTargetFromNormalized(entry.URL)
+		if err != nil {
+			canonical, err = db.deriveCanonicalTarget(entry.URL)
+			if err != nil {
+				continue
+			}
+		}
+
+		count := entry.Count
+		if count <= 0 {
+			count = 1
+		}
+		lastSeen := entry.LastSeen
+		if lastSeen <= 0 {
+			lastSeen = now
+		}
+
+		targets = append(targets, Target{
+			Key:      canonical.TargetURL,
+			URL:      canonical.TargetURL,
+			Title:    strings.TrimSpace(entry.Title),
+			Count:    count,
+			LastSeen: lastSeen,
+			Source:   normalizeSource(entry.Source),
+			HostKey:  canonical.HostKey,
+			NodePath: canonical.NodePath,
+			NodeKey:  canonical.NodeKey,
+		})
+	}
+	db.Targets = targets
+}
+
+func (db *DB) rebuildDerivedState() {
+	now := time.Now().Unix()
+	targetByKey := map[string]*Target{}
+	targets := make([]Target, 0, len(db.Targets))
+
+	for _, target := range db.Targets {
+		if strings.TrimSpace(target.URL) == "" {
+			continue
+		}
+
+		canonical, err := db.deriveCanonicalTargetFromNormalized(target.URL)
+		if err != nil {
+			continue
+		}
+
+		target.Key = canonical.TargetURL
+		target.URL = canonical.TargetURL
+		target.HostKey = canonical.HostKey
+		target.NodePath = canonical.NodePath
+		target.NodeKey = canonical.NodeKey
+		target.Source = normalizeSource(target.Source)
+		target.Title = strings.TrimSpace(target.Title)
+		if target.Count <= 0 {
+			target.Count = 1
+		}
+		if target.LastSeen <= 0 {
+			target.LastSeen = now
+		}
+
+		if existing, ok := targetByKey[target.Key]; ok {
+			existing.Count += target.Count
+			if target.LastSeen > existing.LastSeen {
+				existing.LastSeen = target.LastSeen
+			}
+			if target.Title != "" {
+				existing.Title = target.Title
+			}
+			if existing.Source != SourceManual {
+				existing.Source = target.Source
+			}
+			if target.Source == SourceManual {
+				existing.Source = SourceManual
+			}
+			continue
+		}
+
+		targets = append(targets, target)
+		targetByKey[target.Key] = &targets[len(targets)-1]
+	}
+
+	db.Targets = targets
+
+	nodeMap := map[string]*Node{}
+	for i := range db.Targets {
+		target := &db.Targets[i]
+		chain := buildNodeChain(target.HostKey, target.NodePath)
+		for _, ref := range chain {
+			node := nodeMap[ref.Key]
+			if node == nil {
+				node = &Node{
+					Key:       ref.Key,
+					HostKey:   ref.HostKey,
+					Path:      ref.Path,
+					ParentKey: ref.ParentKey,
+				}
+				nodeMap[ref.Key] = node
+			}
+
+			node.Count += target.Count
+			if target.LastSeen > node.LastSeen {
+				node.LastSeen = target.LastSeen
+			}
+			if current := targetByKey[node.DefaultTargetKey]; current == nil || betterTarget(*target, *current) {
+				node.DefaultTargetKey = target.Key
+			}
+			if target.Source == SourceManual {
+				if current := targetByKey[node.ManualTargetKey]; current == nil || betterTarget(*target, *current) {
+					node.ManualTargetKey = target.Key
+				}
+			}
+			if ref.Key == target.NodeKey {
+				if current := targetByKey[node.ExactTargetKey]; current == nil || betterTarget(*target, *current) {
+					node.ExactTargetKey = target.Key
+				}
+			}
+		}
+	}
+
+	nodes := make([]Node, 0, len(nodeMap))
+	for _, node := range nodeMap {
+		nodes = append(nodes, *node)
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].HostKey == nodes[j].HostKey {
+			if nodeDepth(nodes[i].Path) == nodeDepth(nodes[j].Path) {
+				return nodes[i].Path < nodes[j].Path
+			}
+			return nodeDepth(nodes[i].Path) < nodeDepth(nodes[j].Path)
+		}
+		return nodes[i].HostKey < nodes[j].HostKey
+	})
+	db.Nodes = nodes
+
+	db.Metadata.SchemaVersion = schemaVersion
+	db.syncEntriesFromTargets()
+}
+
+func (db *DB) syncEntriesFromTargets() {
+	entries := make([]Entry, 0, len(db.Targets))
+	for _, target := range db.Targets {
+		entries = append(entries, targetToEntry(target))
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].LastSeen == entries[j].LastSeen {
+			return entries[i].URL < entries[j].URL
+		}
+		return entries[i].LastSeen > entries[j].LastSeen
+	})
+	db.Entries = entries
+}
+
+func (db *DB) resolveAddressMatch(keyword string) (Match, bool) {
+	input := normalizeAddressInput(keyword)
+	if input == "" {
+		return Match{}, false
+	}
+
+	input = db.expandAliasInput(input)
+	parts := strings.SplitN(input, "/", 2)
+	hostToken := parts[0]
+	hostKey := db.resolveHostToken(hostToken)
+	if hostKey == "" {
+		return Match{}, false
+	}
+
+	nodeKey := hostKey
+	if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+		nodePath := db.canonicalNodePath(hostKey, parts[1])
+		nodeKey = buildNodeKey(hostKey, nodePath)
+	}
+
+	if db.findNodeByKey(nodeKey) == nil {
+		return Match{}, false
+	}
+
+	target := db.resolveLandingTarget(nodeKey, map[string]bool{})
+	if target == nil {
+		return Match{}, false
+	}
+
+	return Match{
+		Entry:   targetToEntry(*target),
+		Score:   1_000_000 + float64(target.Count),
+		Reason:  "address",
+		NodeKey: nodeKey,
+	}, true
+}
+
+func (db *DB) resolveLandingTarget(nodeKey string, visited map[string]bool) *Target {
+	if nodeKey == "" {
+		return nil
+	}
+	if visited[nodeKey] {
+		return nil
+	}
+	visited[nodeKey] = true
+
+	node := db.findNodeByKey(nodeKey)
+	if node == nil {
+		return nil
+	}
+
+	if ruleTarget := db.resolveDefaultRule(nodeKey, visited); ruleTarget != nil {
+		return ruleTarget
+	}
+	if target := db.findTargetByKey(node.ManualTargetKey); target != nil {
+		return target
+	}
+	if target := db.findTargetByKey(node.DefaultTargetKey); target != nil {
+		return target
+	}
+	if target := db.findTargetByKey(node.ExactTargetKey); target != nil {
+		return target
+	}
+	return nil
+}
+
+func (db *DB) resolveDefaultRule(nodeKey string, visited map[string]bool) *Target {
+	for _, rule := range db.Rules {
+		if rule.Type != RuleDefault {
+			continue
+		}
+		if rule.Pattern != nodeKey {
+			continue
+		}
+
+		value := strings.TrimSpace(rule.Value)
+		if value == "" {
+			continue
+		}
+
+		if strings.Contains(value, "://") {
+			canonical, err := db.deriveCanonicalTarget(value)
+			if err != nil {
+				continue
+			}
+			if target := db.findTargetByURL(canonical.TargetURL); target != nil {
+				return target
+			}
+			continue
+		}
+
+		if target := db.findTargetByKey(value); target != nil {
+			return target
+		}
+		if node := db.findNodeByKey(value); node != nil {
+			return db.resolveLandingTarget(node.Key, visited)
+		}
+	}
+	return nil
+}
+
+func (db *DB) deriveCanonicalTarget(rawURL string) (canonicalTarget, error) {
+	normalized, err := urlnorm.NormalizeAndRedact(rawURL)
+	if err != nil {
+		return canonicalTarget{}, err
+	}
+	return db.deriveCanonicalTargetFromNormalized(normalized)
+}
+
+func (db *DB) deriveCanonicalTargetFromNormalized(normalized string) (canonicalTarget, error) {
+	u, err := url.Parse(strings.TrimSpace(normalized))
+	if err != nil {
+		return canonicalTarget{}, err
+	}
+
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	if host == "" {
 		host = strings.ToLower(strings.TrimSpace(u.Host))
 	}
 	if host == "" {
-		return CurationMetadata{}, fmt.Errorf("invalid host in url: %s", normalizedURL)
+		return canonicalTarget{}, fmt.Errorf("invalid host in url: %s", normalized)
 	}
 
-	depth := countPathDepth(u.Path)
-	bucket := depthToBucket(depth)
-	topic := topicKeyFromPath(u.Path)
-	group := fmt.Sprintf("%s|%s|%s", host, bucket, topic)
+	if db.matchesIgnoreRule(host, u.Path, normalized) {
+		return canonicalTarget{}, ErrIgnoredByRule
+	}
 
-	return CurationMetadata{
-		HostKey:     host,
-		DepthBucket: bucket,
-		TopicKey:    topic,
-		GroupKey:    group,
+	u.RawQuery = filterQueryValues(u.Query(), db.preservedQueryKeys(host, u.Path))
+	targetURL := u.String()
+	nodePath := db.canonicalNodePath(host, u.Path)
+	chain := buildNodeChain(host, nodePath)
+	nodeKey := host
+	if len(chain) > 0 {
+		nodeKey = chain[len(chain)-1].Key
+	}
+
+	return canonicalTarget{
+		TargetURL: targetURL,
+		HostKey:   host,
+		NodePath:  nodePath,
+		NodeKey:   nodeKey,
+		NodeChain: chain,
 	}, nil
 }
 
-func score(keyword string, e Entry, now time.Time) float64 {
-	if keyword == "" {
-		return math.Max(1, float64(e.Count)) * sourceWeight(e.Source)
+func (db *DB) canonicalNodePath(host, rawPath string) string {
+	segments := splitPathSegments(strings.ToLower(rawPath))
+	normalized := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		normalized = append(normalized, normalizeDynamicSegment(segment))
+	}
+	path := canonicalPathFromSegments(normalized)
+	return db.applyCollapseRules(host, path)
+}
+
+func (db *DB) applyCollapseRules(host, path string) string {
+	path = normalizeComparablePath(path)
+	for _, rule := range db.Rules {
+		if rule.Type != RuleCollapse {
+			continue
+		}
+		if rule.Host != "" && rule.Host != host {
+			continue
+		}
+		if matchRulePath(path, rule.Pattern) {
+			value := normalizeComparablePath(rule.Value)
+			if value != "" {
+				return value
+			}
+		}
+	}
+	return path
+}
+
+func (db *DB) matchesIgnoreRule(host, rawPath, normalized string) bool {
+	path := normalizeComparablePath(strings.ToLower(rawPath))
+	full := strings.ToLower(strings.TrimSpace(normalized))
+	for _, rule := range db.Rules {
+		if rule.Type != RuleIgnore {
+			continue
+		}
+		if rule.Host != "" && rule.Host != host {
+			continue
+		}
+		if rule.Pattern == "" {
+			return true
+		}
+		if matchRulePath(path, rule.Pattern) || strings.Contains(full, strings.ToLower(rule.Pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *DB) preservedQueryKeys(host, rawPath string) map[string]struct{} {
+	keys := map[string]struct{}{}
+	path := normalizeComparablePath(strings.ToLower(rawPath))
+	for _, rule := range db.Rules {
+		if rule.Type != RulePreserveQuery {
+			continue
+		}
+		if rule.Host != "" && rule.Host != host {
+			continue
+		}
+		if !matchRulePath(path, rule.Pattern) {
+			continue
+		}
+		for _, part := range strings.Split(rule.Value, ",") {
+			key := strings.ToLower(strings.TrimSpace(part))
+			if key != "" {
+				keys[key] = struct{}{}
+			}
+		}
+	}
+	return keys
+}
+
+func (db *DB) expandAliasInput(input string) string {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" {
+		return ""
 	}
 
-	urlLower := strings.ToLower(e.URL)
-	titleLower := strings.ToLower(e.Title)
+	for depth := 0; depth < 8; depth++ {
+		changed := false
+		for _, rule := range db.Rules {
+			if rule.Type != RuleAlias {
+				continue
+			}
+			pattern := strings.ToLower(strings.TrimSpace(rule.Pattern))
+			value := strings.ToLower(strings.TrimSpace(rule.Value))
+			if pattern == "" || value == "" {
+				continue
+			}
+			switch {
+			case input == pattern:
+				input = value
+				changed = true
+			case strings.HasPrefix(input, pattern+"/"):
+				input = value + input[len(pattern):]
+				changed = true
+			}
+			if changed {
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return input
+}
 
-	kwScore := 0.0
-	switch {
-	case strings.Contains(titleLower, keyword):
-		kwScore = 1.0
-	case strings.Contains(urlLower, keyword):
-		kwScore = 0.8
+func (db *DB) resolveHostToken(token string) string {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return ""
+	}
+
+	hosts := make([]string, 0, len(db.Nodes))
+	seen := map[string]struct{}{}
+	for _, node := range db.Nodes {
+		if node.Path != "" {
+			continue
+		}
+		if _, ok := seen[node.HostKey]; ok {
+			continue
+		}
+		seen[node.HostKey] = struct{}{}
+		hosts = append(hosts, node.HostKey)
+	}
+
+	for _, host := range hosts {
+		if host == token {
+			return host
+		}
+	}
+
+	if strings.Contains(token, ".") {
+		return ""
+	}
+
+	var exactShort []string
+	for _, host := range hosts {
+		if shortHostName(host) == token {
+			exactShort = append(exactShort, host)
+		}
+	}
+	if len(exactShort) == 1 {
+		return exactShort[0]
+	}
+
+	var prefix []string
+	for _, host := range hosts {
+		if strings.HasPrefix(shortHostName(host), token) {
+			prefix = append(prefix, host)
+		}
+	}
+	if len(prefix) == 1 {
+		return prefix[0]
+	}
+
+	var contains []string
+	for _, host := range hosts {
+		if strings.Contains(host, token) {
+			contains = append(contains, host)
+		}
+	}
+	if len(contains) == 1 {
+		return contains[0]
+	}
+
+	return ""
+}
+
+func (db *DB) findTargetByURL(url string) *Target {
+	for i := range db.Targets {
+		if db.Targets[i].URL == url {
+			return &db.Targets[i]
+		}
+	}
+	return nil
+}
+
+func (db *DB) findTargetByKey(key string) *Target {
+	for i := range db.Targets {
+		if db.Targets[i].Key == key {
+			return &db.Targets[i]
+		}
+	}
+	return nil
+}
+
+func (db *DB) findNodeByKey(key string) *Node {
+	for i := range db.Nodes {
+		if db.Nodes[i].Key == key {
+			return &db.Nodes[i]
+		}
+	}
+	return nil
+}
+
+func normalizeRule(rule Rule) Rule {
+	rule.Type = strings.ToLower(strings.TrimSpace(rule.Type))
+	rule.Host = strings.ToLower(strings.TrimSpace(rule.Host))
+
+	value := strings.TrimSpace(rule.Value)
+	switch rule.Type {
+	case RuleAlias:
+		rule.Pattern = strings.ToLower(strings.TrimSpace(rule.Pattern))
+		rule.Value = strings.ToLower(value)
+	case RuleCollapse, RuleDefault:
+		rule.Pattern = normalizeRulePattern(rule.Pattern)
+		if strings.Contains(value, "://") {
+			rule.Value = value
+		} else {
+			rule.Value = normalizeRulePattern(value)
+			if rule.Type == RuleDefault && !strings.Contains(rule.Value, "/") && rule.Value != "" && strings.Contains(value, ".") {
+				rule.Value = strings.ToLower(strings.TrimSpace(value))
+			}
+		}
+	case RulePreserveQuery:
+		rule.Pattern = normalizeRulePattern(rule.Pattern)
+		parts := strings.Split(value, ",")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			key := strings.ToLower(strings.TrimSpace(part))
+			if key != "" {
+				out = append(out, key)
+			}
+		}
+		rule.Value = strings.Join(out, ",")
 	default:
-		return 0
+		rule.Pattern = normalizeRulePattern(rule.Pattern)
+		rule.Value = value
+	}
+	return rule
+}
+
+func normalizeRulePattern(pattern string) string {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return ""
+	}
+	if strings.Contains(pattern, "://") {
+		return pattern
+	}
+	if strings.Contains(pattern, ".") && !strings.HasPrefix(pattern, "/") && !strings.Contains(pattern, "*") {
+		return pattern
+	}
+	if !strings.HasPrefix(pattern, "/") {
+		pattern = "/" + pattern
+	}
+	return strings.TrimSuffix(pattern, "/")
+}
+
+func normalizeAddressInput(input string) string {
+	fields := strings.Fields(strings.TrimSpace(input))
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.Join(fields, "/"))
+}
+
+func fuzzyMatchReason(keyword string, node Node, target Target) (string, float64) {
+	if keyword == "" {
+		return "", 0
 	}
 
-	daysAgo := now.Sub(time.Unix(e.LastSeen, 0)).Hours() / 24
+	short := shortHostName(node.HostKey)
+	switch {
+	case short == keyword || node.HostKey == keyword || node.Key == keyword:
+		return "host", 1.5
+	case strings.Contains(node.Key, keyword):
+		return "node", 1.25
+	case strings.Contains(strings.ToLower(target.Title), keyword):
+		return "title", 1.0
+	case strings.Contains(strings.ToLower(target.URL), keyword):
+		return "url", 0.8
+	default:
+		return "", 0
+	}
+}
+
+func scoreNode(keywordScore float64, node Node, target Target, now time.Time) float64 {
+	daysAgo := now.Sub(time.Unix(node.LastSeen, 0)).Hours() / 24
 	if daysAgo < 0 {
 		daysAgo = 0
 	}
 	lambda := math.Ln2 / 14.0
 	decay := math.Exp(-lambda * daysAgo)
-
-	base := math.Max(1, float64(e.Count))
-	ctx := 1 + 0.9*kwScore
-	return base * decay * ctx * sourceWeight(e.Source)
+	base := math.Max(1, float64(node.Count))
+	depthBoost := 1 + 0.10*float64(nodeDepth(node.Path))
+	return base * decay * keywordScore * depthBoost * sourceWeight(target.Source)
 }
 
 func sourceWeight(source string) float64 {
@@ -377,165 +1019,237 @@ func sourceWeight(source string) float64 {
 	case SourceManual:
 		return 1.35
 	case SourceAuto:
-		return 0.95
-	default:
 		return 1.0
+	default:
+		return 1.05
 	}
 }
 
 func normalizeSource(source string) string {
-	s := strings.ToLower(strings.TrimSpace(source))
-	switch s {
+	switch strings.ToLower(strings.TrimSpace(source)) {
 	case SourceManual, SourceAuto, SourceLegacy:
-		return s
+		return strings.ToLower(strings.TrimSpace(source))
 	default:
 		return SourceLegacy
 	}
 }
 
-func clearAutoMetadata(e *Entry) {
-	e.GroupKey = ""
-	e.DepthBucket = ""
-	e.TopicKey = ""
-	e.Representative = false
+func filterQueryValues(values url.Values, keep map[string]struct{}) string {
+	if len(values) == 0 || len(keep) == 0 {
+		return ""
+	}
+
+	filtered := url.Values{}
+	for key, original := range values {
+		if _, ok := keep[strings.ToLower(key)]; !ok {
+			continue
+		}
+		filtered[key] = original
+	}
+	return filtered.Encode()
 }
 
-func (db *DB) ensureCompatibility() {
-	now := time.Now().Unix()
-	for i := range db.Entries {
-		e := &db.Entries[i]
-		if e.Count <= 0 {
-			e.Count = 1
-		}
-		if e.LastSeen <= 0 {
-			e.LastSeen = now
-		}
-		e.Title = strings.TrimSpace(e.Title)
-		e.Source = normalizeSource(e.Source)
+func buildNodeChain(host, path string) []nodeRef {
+	path = normalizeComparablePath(path)
+	chain := []nodeRef{{
+		Key:     host,
+		HostKey: host,
+		Path:    "",
+	}}
+	if path == "" {
+		return chain
+	}
 
-		if e.Source == SourceAuto {
-			if e.GroupKey == "" || e.DepthBucket == "" || e.TopicKey == "" {
-				meta, err := DeriveCurationMetadata(e.URL)
-				if err == nil {
-					e.GroupKey = meta.GroupKey
-					e.DepthBucket = meta.DepthBucket
-					e.TopicKey = meta.TopicKey
-				}
-			}
+	segments := splitPathSegments(path)
+	current := ""
+	parent := host
+	for _, segment := range segments {
+		if current == "" {
+			current = "/" + segment
 		} else {
-			e.Representative = false
+			current += "/" + segment
 		}
+		key := buildNodeKey(host, current)
+		chain = append(chain, nodeRef{
+			Key:       key,
+			HostKey:   host,
+			Path:      current,
+			ParentKey: parent,
+		})
+		parent = key
 	}
-	db.reconcileAllAutoRepresentatives()
+	return chain
 }
 
-func (db *DB) reconcileAllAutoRepresentatives() {
-	groups := map[string]struct{}{}
-	for i := range db.Entries {
-		e := &db.Entries[i]
-		if normalizeSource(e.Source) != SourceAuto {
-			continue
+func buildNodeKey(host, path string) string {
+	path = normalizeComparablePath(path)
+	if path == "" {
+		return host
+	}
+	return host + path
+}
+
+func splitPathSegments(path string) []string {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return nil
+	}
+	parts := strings.Split(path, "/")
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			segments = append(segments, part)
 		}
-		if e.GroupKey == "" {
-			meta, err := DeriveCurationMetadata(e.URL)
-			if err != nil {
-				continue
+	}
+	return segments
+}
+
+func canonicalPathFromSegments(segments []string) string {
+	clean := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment != "" {
+			clean = append(clean, segment)
+		}
+	}
+	if len(clean) == 0 {
+		return ""
+	}
+	return "/" + strings.Join(clean, "/")
+}
+
+func normalizeComparablePath(path string) string {
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" || path == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return strings.TrimSuffix(path, "/")
+}
+
+func normalizeDynamicSegment(segment string) string {
+	segment = strings.ToLower(strings.TrimSpace(segment))
+	if segment == "" {
+		return ""
+	}
+	if isAllDigits(segment) || looksUUID(segment) {
+		return ":id"
+	}
+	return segment
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func looksUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
 			}
-			e.GroupKey = meta.GroupKey
-			e.DepthBucket = meta.DepthBucket
-			e.TopicKey = meta.TopicKey
+		default:
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				return false
+			}
 		}
-		groups[e.GroupKey] = struct{}{}
 	}
-	for g := range groups {
-		db.reconcileAutoGroup(g)
-	}
+	return true
 }
 
-func (db *DB) reconcileAutoGroup(groupKey string) {
-	if strings.TrimSpace(groupKey) == "" {
-		return
+func matchRulePath(path, pattern string) bool {
+	path = normalizeComparablePath(path)
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return true
 	}
 
-	bestIdx := -1
-	for i := range db.Entries {
-		e := &db.Entries[i]
-		if normalizeSource(e.Source) != SourceAuto || e.GroupKey != groupKey {
-			continue
-		}
-		if bestIdx == -1 || isBetterRepresentative(*e, db.Entries[bestIdx]) {
-			bestIdx = i
-		}
+	if strings.HasSuffix(pattern, "*") && strings.Count(pattern, "*") == 1 {
+		prefix := strings.TrimSuffix(pattern, "*")
+		prefix = normalizeComparablePath(prefix)
+		return strings.HasPrefix(path, prefix)
 	}
 
-	for i := range db.Entries {
-		e := &db.Entries[i]
-		if normalizeSource(e.Source) == SourceAuto && e.GroupKey == groupKey {
-			e.Representative = (i == bestIdx)
+	pattern = normalizeComparablePath(pattern)
+	if strings.Contains(pattern, "*") {
+		patternSegs := splitPathSegments(pattern)
+		pathSegs := splitPathSegments(path)
+		if len(patternSegs) != len(pathSegs) {
+			return false
 		}
+		for i := range patternSegs {
+			if patternSegs[i] != "*" && patternSegs[i] != pathSegs[i] {
+				return false
+			}
+		}
+		return true
 	}
+
+	if path == pattern {
+		return true
+	}
+	return strings.HasPrefix(path, pattern+"/")
 }
 
-func isBetterRepresentative(a, b Entry) bool {
+func betterTarget(a, b Target) bool {
 	if a.LastSeen != b.LastSeen {
 		return a.LastSeen > b.LastSeen
+	}
+	if nodeDepth(a.NodePath) != nodeDepth(b.NodePath) {
+		return nodeDepth(a.NodePath) > nodeDepth(b.NodePath)
 	}
 	if a.Count != b.Count {
 		return a.Count > b.Count
 	}
+	if sourceWeight(a.Source) != sourceWeight(b.Source) {
+		return sourceWeight(a.Source) > sourceWeight(b.Source)
+	}
 	return a.URL < b.URL
 }
 
-func countPathDepth(path string) int {
-	trimmed := strings.Trim(path, "/")
-	if trimmed == "" {
+func targetToEntry(target Target) Entry {
+	return Entry{
+		URL:      target.URL,
+		Title:    target.Title,
+		Count:    target.Count,
+		LastSeen: target.LastSeen,
+		Source:   normalizeSource(target.Source),
+	}
+}
+
+func shortHostName(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return ""
+	}
+	parts := strings.Split(host, ".")
+	return parts[0]
+}
+
+func nodeDepth(path string) int {
+	return len(splitPathSegments(path))
+}
+
+func pathDepth(nodeKey string) int {
+	idx := strings.Index(nodeKey, "/")
+	if idx == -1 {
 		return 0
 	}
-	parts := strings.Split(trimmed, "/")
-	depth := 0
-	for _, p := range parts {
-		if strings.TrimSpace(p) != "" {
-			depth++
-		}
-	}
-	return depth
-}
-
-func depthToBucket(depth int) string {
-	switch {
-	case depth <= 1:
-		return DepthBucketShallow
-	case depth <= 3:
-		return DepthBucketMedium
-	default:
-		return DepthBucketDeep
-	}
-}
-
-func topicKeyFromPath(path string) string {
-	trimmed := strings.Trim(path, "/")
-	if trimmed == "" {
-		return "_root"
-	}
-	parts := strings.Split(trimmed, "/")
-	first := strings.ToLower(strings.TrimSpace(parts[0]))
-	if first == "" {
-		return "_root"
-	}
-	if len(first) > 48 {
-		first = first[:48]
-	}
-	return first
-}
-
-func entryDepth(rawURL string) int {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return 0
-	}
-	return countPathDepth(u.Path)
-}
-
-func isDeepPage(rawURL string) bool {
-	return entryDepth(rawURL) >= 1
+	return nodeDepth(nodeKey[idx:])
 }
