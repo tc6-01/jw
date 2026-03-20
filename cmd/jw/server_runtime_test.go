@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestParseOnOff(t *testing.T) {
@@ -88,5 +89,21 @@ func TestWriteAndReadServerStateRoundTrip(t *testing.T) {
 	}
 	if out.PID != in.PID || out.Addr != in.Addr || out.StartedAt != in.StartedAt {
 		t.Fatalf("state=%+v want=%+v", out, in)
+	}
+}
+
+func TestChromeVisitTimeToUnix(t *testing.T) {
+	// 2020-01-01 00:00:00 UTC in Chrome microseconds since 1601-01-01 UTC.
+	const chromeUS = int64(13222310400000000)
+	got := chromeVisitTimeToUnix(chromeUS)
+	want := int64(1577836800)
+	if got != want {
+		t.Fatalf("chromeVisitTimeToUnix=%d want=%d", got, want)
+	}
+
+	zero := chromeVisitTimeToUnix(0)
+	now := time.Now().Unix()
+	if zero < now-5 || zero > now+5 {
+		t.Fatalf("zero visit fallback out of range: %d now=%d", zero, now)
 	}
 }

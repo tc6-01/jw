@@ -168,3 +168,76 @@ func TestJumpHandlerValidation(t *testing.T) {
 		t.Fatalf("no match status=%d", noMatchW.Code)
 	}
 }
+
+func TestJumpHTTPAndCLIResolverSharePolicy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path, db, err := loadDB()
+	if err != nil {
+		t.Fatalf("loadDB failed: %v", err)
+	}
+	now := int64(1_700_000_000)
+	db.Entries = []localstore.Entry{
+		{
+			URL:      "https://example.com",
+			Title:    "Root",
+			Count:    10,
+			LastSeen: now,
+			Source:   localstore.SourceLegacy,
+		},
+		{
+			URL:            "https://example.com/docs/a",
+			Title:          "Docs A",
+			Count:          10,
+			LastSeen:       now - 30,
+			Source:         localstore.SourceAuto,
+			GroupKey:       "example.com|d2-3|docs",
+			DepthBucket:    localstore.DepthBucketMedium,
+			TopicKey:       "docs",
+			Representative: true,
+		},
+		{
+			URL:            "https://example.com/blog/b",
+			Title:          "Blog B",
+			Count:          10,
+			LastSeen:       now - 5,
+			Source:         localstore.SourceAuto,
+			GroupKey:       "example.com|d2-3|blog",
+			DepthBucket:    localstore.DepthBucketMedium,
+			TopicKey:       "blog",
+			Representative: true,
+		},
+	}
+	if err := saveDB(path, db); err != nil {
+		t.Fatalf("saveDB failed: %v", err)
+	}
+
+	h := newServerMux()
+	jumpReq := httptest.NewRequest(http.MethodGet, "/jump?q=example", nil)
+	jumpW := httptest.NewRecorder()
+	h.ServeHTTP(jumpW, jumpReq)
+	if jumpW.Code != http.StatusOK {
+		t.Fatalf("jump status=%d body=%s", jumpW.Code, jumpW.Body.String())
+	}
+	type jumpResp struct {
+		URL string `json:"url"`
+	}
+	jumpBody := decodeJSONBody[jumpResp](t, jumpW.Body)
+
+	path2, db2, err := loadDB()
+	if err != nil {
+		t.Fatalf("reload db failed: %v", err)
+	}
+	best, err := resolveJumpMatch(path2, db2, "example")
+	if err != nil {
+		t.Fatalf("resolveJumpMatch failed: %v", err)
+	}
+
+	if jumpBody.URL != best.Entry.URL {
+		t.Fatalf("http jump url=%q resolver url=%q", jumpBody.URL, best.Entry.URL)
+	}
+	if jumpBody.URL != "https://example.com/blog/b" {
+		t.Fatalf("unexpected jump target=%q", jumpBody.URL)
+	}
+}

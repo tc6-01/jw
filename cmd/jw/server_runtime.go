@@ -208,7 +208,8 @@ func importChromeHistoryOnce(cfgPath string) (int, error) {
 
 	imported := 0
 	for _, row := range rows {
-		if _, err := db.Add(row.URL, row.Title); err != nil {
+		visitedAt := chromeVisitTimeToUnix(row.LastVisit)
+		if _, err := db.AddAuto(row.URL, row.Title, visitedAt); err != nil {
 			continue
 		}
 		imported++
@@ -344,6 +345,19 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+func chromeVisitTimeToUnix(chromeVisitUS int64) int64 {
+	// Chrome stores visit time as microseconds since 1601-01-01 UTC.
+	const chromeToUnixOffsetSec = int64(11644473600)
+	if chromeVisitUS <= 0 {
+		return time.Now().Unix()
+	}
+	unixSec := chromeVisitUS/1_000_000 - chromeToUnixOffsetSec
+	if unixSec <= 0 {
+		return time.Now().Unix()
+	}
+	return unixSec
 }
 
 func startServerInBackground(addr string) {

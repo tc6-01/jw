@@ -234,7 +234,7 @@ func handleJump(args []string) {
 		fmt.Printf("初始化存储失败: %v\n", err)
 		os.Exit(1)
 	}
-	best, err := db.Best(keyword)
+	best, err := resolveJumpMatch(path, db, keyword)
 	if err != nil {
 		if err == localstore.ErrNoMatch {
 			fmt.Println("没有匹配结果")
@@ -242,12 +242,6 @@ func handleJump(args []string) {
 		}
 		fmt.Printf("jump 失败: %v\n", err)
 		os.Exit(1)
-	}
-
-	if _, err := db.Add(best.Entry.URL, best.Entry.Title); err == nil {
-		if err := saveDB(path, db); err != nil {
-			fmt.Printf("写入存储失败: %v\n", err)
-		}
 	}
 
 	if err := openURL(best.Entry.URL); err != nil {
@@ -418,20 +412,27 @@ func newServerMux() *http.ServeMux {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		best, err := db.Best(keyword)
+		best, err := resolveJumpMatch(path, db, keyword)
 		if err != nil {
 			http.Error(w, "no match", http.StatusNotFound)
 			return
-		}
-
-		if _, err := db.Add(best.Entry.URL, best.Entry.Title); err == nil {
-			_ = saveDB(path, db)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "url": best.Entry.URL, "score": best.Score})
 	})
 	return mux
+}
+
+func resolveJumpMatch(path string, db *localstore.DB, keyword string) (localstore.Match, error) {
+	best, err := db.Best(keyword)
+	if err != nil {
+		return localstore.Match{}, err
+	}
+	if db.TouchNormalized(best.Entry.URL) {
+		_ = saveDB(path, db)
+	}
+	return best, nil
 }
 
 func openURL(rawURL string) error {

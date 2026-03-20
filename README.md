@@ -55,6 +55,14 @@ jw config auto-import-history on
 - `POST /record`
 - `GET /jump?q=<keyword>`
 
+## 自动导入整理与跳转优先级
+- 自动导入采用内置整理（Hybrid）策略：按 `host + depth-bucket + topic` 分组。
+- 同一分组内仅保留 `1` 个自动导入代表页用于排序与默认跳转，减少同域名噪声。
+- 不同深度分桶互不覆盖（例如浅层与深层页面可同时保留代表页）。
+- 手动添加（`jw add` / `POST /record`）始终高于自动导入优先级。
+- 在没有强手动候选时，自动导入候选可主导结果。
+- `jw jump` 与 `GET /jump` 共用同一套解析策略，默认优先落到“最近深页面”。
+
 ## 是否需要后台服务？
 - 不需要后台也能用：`jw add/query/jump/list/rm` 全部可直接运行。
 - 建议开后台的场景：
@@ -99,6 +107,21 @@ jw config auto-import-history on
   "title": "GitHub"
 }
 ```
+
+## 迁移与回滚说明
+- 旧版本 `store.json` 记录在新逻辑下会兼容为 `legacy` 来源语义（中性优先级）。
+- 迁移不要求用户手动清空本地数据，旧记录会自动兼容读取。
+- 若需要临时回滚到“无自动导入干预”的行为：
+  - 执行 `jw config auto-import-history off` 停止新增自动导入数据。
+  - 可继续使用 `jw add/query/jump/list/rm` 的手动路径。
+
+## 运营调优建议（Depth / Topic）
+- 当前实现使用固定深度分桶：`d0-1`、`d2-3`、`d4+`。
+- `topic` 默认使用路径首段（如 `/docs/*`、`/blog/*`）区分同域内容流。
+- 如果发现“合并过粗”（不同内容被混在一起）：
+  - 优先细化 topic 规则（例如引入二级段）。
+- 如果发现“合并过细”（噪声仍然偏高）：
+  - 优先放宽 topic 规则或收敛深度分桶边界。
 
 ## 数据存储
 - 本地文件：`~/.jw/store.json`
