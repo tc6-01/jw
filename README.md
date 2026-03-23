@@ -48,9 +48,23 @@
 
 ### 1) 安装
 
+推荐通过 Homebrew 安装：
+
 ```bash
 brew tap tc6-01/homebrew-tap
-brew install tc6-01/tap/jw
+brew install tc6-01/homebrew-tap/jw
+```
+
+如果你在开发或想直接从源码安装，也可以：
+
+```bash
+go install github.com/tc6-01/jw/cmd/jw@latest
+```
+
+安装后可以先确认版本：
+
+```bash
+jw version
 ```
 
 ### 2) 先手动记几个常用页面
@@ -205,6 +219,23 @@ jw server stop
 
 - 我必须开启后台服务吗？
   - 不必须。只做手动添加和跳转时，可以不启用。只有自动导入和本地服务接口依赖 `jw server`。
+
+## 发布与 Homebrew
+
+当前仓库使用 GitHub tag 驱动发布：
+
+- 推送 `v*` tag 后，GitHub Actions 会执行 GoReleaser
+- GoReleaser 会构建 release 产物并创建 GitHub Release
+- 同时自动更新 `tc6-01/homebrew-tap` 中的 `jw` formula
+
+如果你是用户，通常只需要执行：
+
+```bash
+brew update
+brew upgrade tc6-01/homebrew-tap/jw
+```
+
+注意：自动导入浏览器历史依赖系统里的 `sqlite3` 可执行文件；即使通过 release 或 Homebrew 安装成功，这一能力也仍需要本机具备该依赖。
 
 ## 本地服务接口
 

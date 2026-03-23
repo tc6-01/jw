@@ -17,6 +17,12 @@ import (
 	"jw/internal/domain/urlnorm"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -29,6 +35,8 @@ func main() {
 	switch cmd {
 	case "help", "-h", "--help":
 		printHelp()
+	case "version", "-v", "--version":
+		handleVersion()
 	case "normalize":
 		handleNormalize(args)
 	case "score-demo":
@@ -77,6 +85,13 @@ func printHelp() {
 	fmt.Println("  jw rm <url|title>        删除一条记录")
 	fmt.Println("  jw tutorial              运行 30 秒可执行教程")
 	fmt.Println("  jw about                 查看产品介绍与上手路径")
+	fmt.Println("  jw version               查看版本与构建信息")
+}
+
+func handleVersion() {
+	fmt.Printf("jw %s\n", version)
+	fmt.Printf("commit: %s\n", commit)
+	fmt.Printf("built: %s\n", date)
 }
 
 func handleNormalize(args []string) {
@@ -149,6 +164,7 @@ func handleAbout() {
 	fmt.Println("需要完整命令入口请运行: jw help")
 	fmt.Println("本地数据路径: ~/.jw/store.json")
 	fmt.Println("更多说明: README.md")
+	fmt.Printf("Version: %s\n", version)
 	fmt.Println("Repo: https://github.com/tc6-01/jw")
 	fmt.Println("License: MIT")
 }

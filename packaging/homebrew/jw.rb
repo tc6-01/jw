@@ -13,7 +13,12 @@ class Jw < Formula
   end
 
   test do
-    output = shell_output("#{bin}/jw tutorial")
-    assert_match "jw 可执行教程", output
+    output = shell_output("#{bin}/jw version")
+    assert_match version.to_s, output
   end
 end
+
+# NOTE:
+# This file is a local reference formula for packaging development.
+# The user-facing Homebrew formula should be published to tc6-01/homebrew-tap
+# and maintained by GoReleaser from release tags.

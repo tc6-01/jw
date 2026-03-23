@@ -67,10 +67,42 @@ func TestPrintHelpIncludesServerLifecycleAndConfig(t *testing.T) {
 		"jw server start",
 		"jw server stop|status",
 		"jw config auto-import-history on|off",
+		"jw version",
 	}
 	for _, s := range checks {
 		if !strings.Contains(out, s) {
 			t.Fatalf("help output missing %q, got: %s", s, out)
 		}
+	}
+}
+
+func TestHandleVersionOutput(t *testing.T) {
+	oldVersion, oldCommit, oldDate := version, commit, date
+	version, commit, date = "v0.2.0", "abc123", "2026-03-20T10:00:00Z"
+	defer func() {
+		version, commit, date = oldVersion, oldCommit, oldDate
+	}()
+
+	out := captureStdout(t, handleVersion)
+	checks := []string{
+		"jw v0.2.0",
+		"commit: abc123",
+		"built: 2026-03-20T10:00:00Z",
+	}
+	for _, s := range checks {
+		if !strings.Contains(out, s) {
+			t.Fatalf("version output missing %q, got: %s", s, out)
+		}
+	}
+}
+
+func TestHandleAboutIncludesVersion(t *testing.T) {
+	oldVersion := version
+	version = "v0.2.0"
+	defer func() { version = oldVersion }()
+
+	out := captureStdout(t, handleAbout)
+	if !strings.Contains(out, "Version: v0.2.0") {
+		t.Fatalf("about output should include version, got: %s", out)
 	}
 }
